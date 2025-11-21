@@ -1,0 +1,65 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 21 16:44:17 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Visualize ONLY the ECG channel for a given subject/run from the original data
+(before any artifact removal).
+
+Example: Subject 1 – run 03.
+"""
+
+from pathlib import Path
+import mne
+import re
+
+# ===================== CONFIGURE THIS PART =====================
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+subject = 1
+run = 3
+task = "median"
+
+# ===============================================================
+
+subject_id = f"sub-{subject:03d}"
+eeg_dir = BASE / subject_id / "eeg"
+setfile = eeg_dir / f"{subject_id}_task-{task}_run-{run:02d}_eeg.set"
+
+print("Loading:", setfile)
+
+# Load original raw data (no preprocessing)
+raw = mne.io.read_raw_eeglab(setfile, preload=False, verbose="warning")
+print(raw)
+
+# ------------------ Find the ECG channel ------------------
+# Many datasets use names like "ECG", "ecg", "ECG1", etc.
+ecg_channels = [ch for ch in raw.ch_names if "ecg" in ch.lower()]
+
+if not ecg_channels:
+    raise RuntimeError("No ECG channel was found in this dataset.")
+
+print("\nECG channels found:", ecg_channels)
+
+# Load only the ECG channel into memory (saves RAM)
+raw_ecg = raw.copy().pick(ecg_channels)
+raw_ecg.load_data()
+
+# ------------------ Interactive visualization ------------------
+raw_ecg.plot(
+    duration=4.0,      # 4 seconds per window
+    start=0.0,         # start at t=0
+    n_channels=len(ecg_channels),
+    block=True         # keep window open
+)
+
+"""
+Instructions:
+- Scroll horizontally with the mouse wheel or bottom scrollbar.
+- Double-click a trace to auto-scale.
+- Use "Scale" to adjust amplitude.
+- Use "Go to" to jump to a specific time of interest.
+"""
