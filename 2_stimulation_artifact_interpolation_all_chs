@@ -1,16 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Nov 21 15:55:56 2025
-
-@author: martanavarrobernad
-
-Stimulation artifact removal (PCHIP) on EEG + ESG channels
+Stimulation artifact removal (PCHIP) on all analog channels (EEG, ESG, ECG, ENG, etc.)
 
 Pipeline:
 1. Use cfg_artifact_windows_cervical.csv for subject-specific artifact windows.
 2. Load each original EEGLAB .set file (10 kHz) from the local BIDS directory.
-3. For each stimulus, interpolate the window [start_ms, end_ms] on EEG + ESG
-   channels (based on channel type information in the dataset).
+3. For each stimulus, interpolate the window [start_ms, end_ms] on all channels
+   except stimulus/misc channels (based on channel type information in the dataset).
 4. Save one .fif file per run:
    "noStimart_10kHz_task-<TASK>_run-<XX>.fif"
 """
@@ -82,13 +78,13 @@ def interpolate_stim_artifact(raw, onsets, start_ms, end_ms, picks, n_pad=5):
     Parameters
     ----------
     raw : mne.io.Raw
-        Raw object containing EEG/ESG data.
+        Raw object containing data.
     onsets : array-like
         Stimulus onsets in seconds.
     start_ms, end_ms : float
         Artifact window relative to each stimulus (in milliseconds).
     picks : list of str
-        Channel names to clean (typically EEG + ESG).
+        Channel names to clean (all analog channels except stim/misc).
     n_pad : int
         Number of samples before and after the artifact window used
         to build the PCHIP interpolant.
@@ -179,22 +175,26 @@ def main():
                 print("   No stimulation events found, skipping run.")
                 continue
 
-            # Load full data (EEG + ESG + ENG + others)
-            raw = mne.io.read_raw_eeglab(setfile, preload=True, verbose=False)
+            # Load full data (EEG + ESG + ECG + ENG + others)
+            raw = mne.io.read_raw_eeglab(setfile, preload=False, verbose=False)
+
+            # Load data to memory and convert to float32 to reduce RAM usage
+            raw.load_data()
+            raw._data = raw._data.astype(np.float32)
 
             # Channel selection based on channel type in the dataset:
-            # clean only channels whose type is "eeg" or "esg"
+            # clean all channels except stimulus/misc
             ch_types = raw.get_channel_types()
             ch_to_clean = [
                 ch for ch, t in zip(raw.ch_names, ch_types)
-                if t in ("eeg", "esg")
+                if t not in ("stim", "misc")
             ]
 
             print(f"   Total channels: {len(raw.ch_names)} | sfreq = {raw.info['sfreq']} Hz")
-            print(f"   Channels to clean (type eeg/esg): {len(ch_to_clean)}")
+            print(f"   Channels to clean (all non-stim/misc): {len(ch_to_clean)}")
             print(f"   Number of stimuli: {len(onsets)}")
 
-            # 3) PCHIP interpolation of the stimulation artifact on EEG + ESG
+            # 3) PCHIP interpolation of the stimulation artifact on all analog channels
             interpolate_stim_artifact(
                 raw,
                 onsets,
@@ -217,10 +217,11 @@ def main():
 
             del raw
 
-    print("\nFinished: stimulation artifact interpolated for EEG + ESG channels.")
+    print("\nFinished: stimulation artifact interpolated for all non-stim channels.")
 
 
 if __name__ == "__main__":
     main()
+
 
 
