@@ -3,15 +3,16 @@
 Created on Fri Nov 21 15:55:56 2025
 
 @author: martanavarrobernad
-"""
-"""
-Cervical ESG stimulation artifact removal using PCHIP interpolation
+
+Stimulation artifact removal (PCHIP) on EEG + ESG channels
 
 Pipeline:
 1. Use cfg_artifact_windows_cervical.csv for subject-specific artifact windows.
 2. Load each original EEGLAB .set file (10 kHz) from the local BIDS directory.
-3. For each stimulus, interpolate the window [start_ms, end_ms] on cervical ESG channels.
-4. Save one .fif file per run: "esg_noStimart_10kHz_task-XXX_run-YY.fif".
+3. For each stimulus, interpolate the window [start_ms, end_ms] on EEG + ESG
+   channels (based on channel type information in the dataset).
+4. Save one .fif file per run:
+   "noStimart_10kHz_task-<TASK>_run-<XX>.fif"
 """
 
 from pathlib import Path
@@ -30,18 +31,11 @@ BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 # CSV with subject-specific artifact windows (produced by the previous script)
 CFG_WIN_CSV = BASE / "cfg_artifact_windows_cervical.csv"
 
-# Output directory for artifact-cleaned cervical ESG data
-OUT_DIR = BASE / "esg_10kHz_noStimart"
+# Output directory for artifact-cleaned data
+OUT_DIR = BASE / "eeg_esg_10kHz_noStimart"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 TASK_NAME = "median"
-
-# Cervical ESG channels (only these will be cleaned)
-ESG_CERV = [
-    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
-    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
-    "SC6"
-]
 
 
 # ==== 2) HELPER FUNCTIONS ====
@@ -73,7 +67,7 @@ def read_events_tsv(events_tsv: Path):
         if on.size:
             return on.astype(float)
 
-    # 2) Fallback: use the most frequent non-response event code in "value"
+    # 2) Fallback: use the most frequent event code in "value"
     if "value" in df.columns and df["value"].notna().any():
         vv = df["value"].value_counts().idxmax()
         return df.loc[df["value"] == vv, "onset"].values.astype(float)
@@ -81,24 +75,34 @@ def read_events_tsv(events_tsv: Path):
     return None
 
 
-def interpolate_stim_artifact(raw_esg, onsets, start_ms, end_ms, n_pad=5):
+def interpolate_stim_artifact(raw, onsets, start_ms, end_ms, picks, n_pad=5):
     """
-    Interpolate the stimulation artifact using PCHIP for each cervical ESG channel.
+    Interpolate the stimulation artifact using PCHIP for selected channels.
 
     Parameters
     ----------
-    raw_esg : mne.io.Raw
-        Raw object containing ONLY cervical ESG channels.
+    raw : mne.io.Raw
+        Raw object containing EEG/ESG data.
     onsets : array-like
         Stimulus onsets in seconds.
     start_ms, end_ms : float
         Artifact window relative to each stimulus (in milliseconds).
+    picks : list of str
+        Channel names to clean (typically EEG + ESG).
     n_pad : int
         Number of samples before and after the artifact window used
         to build the PCHIP interpolant.
     """
-    sf = raw_esg.info["sfreq"]
-    data = raw_esg._data  # shape (n_channels, n_times)
+    if not picks:
+        return
+
+    sf = raw.info["sfreq"]
+    data = raw._data  # shape (n_channels, n_times)
+
+    # Channel indices corresponding to the given names
+    ch_indices = [raw.ch_names.index(ch) for ch in picks if ch in raw.ch_names]
+    if len(ch_indices) == 0:
+        return
 
     s0 = int(round(start_ms / 1000 * sf))
     s1 = int(round(end_ms / 1000 * sf))
@@ -123,7 +127,7 @@ def interpolate_stim_artifact(raw_esg, onsets, start_ms, end_ms, n_pad=5):
 
         x_interp = np.arange(i0, i1 + 1)
 
-        for ch in range(data.shape[0]):
+        for ch in ch_indices:
             y_known = data[ch, x_known]
 
             # If the segment is almost flat, fill with mean value
@@ -140,7 +144,7 @@ def interpolate_stim_artifact(raw_esg, onsets, start_ms, end_ms, n_pad=5):
 def main():
     # 1) Read CSV with artifact windows
     if not CFG_WIN_CSV.exists():
-        print(" Artifact-window CSV not found:", CFG_WIN_CSV)
+        print("Artifact-window CSV not found:", CFG_WIN_CSV)
         return
 
     cfg = pd.read_csv(CFG_WIN_CSV)
@@ -172,41 +176,51 @@ def main():
             events_tsv = setfile.with_name(f"{base_name}_events.tsv")
             onsets = read_events_tsv(events_tsv)
             if onsets is None or len(onsets) == 0:
-                print("    No stimulation events found, skipping run.")
+                print("   No stimulation events found, skipping run.")
                 continue
 
-            # Load only cervical ESG channels
-            raw = mne.io.read_raw_eeglab(setfile, preload=False, verbose=False)
-            esg_present = [ch for ch in ESG_CERV if ch in raw.ch_names]
-            if not esg_present:
-                print("    No cervical ESG channels in this run, skipping.")
-                del raw
-                continue
+            # Load full data (EEG + ESG + ENG + others)
+            raw = mne.io.read_raw_eeglab(setfile, preload=True, verbose=False)
 
-            raw_c = raw.copy().pick(esg_present, verbose=False)
-            raw_c.load_data()  # load only the cervical channels into RAM
+            # Channel selection based on channel type in the dataset:
+            # clean only channels whose type is "eeg" or "esg"
+            ch_types = raw.get_channel_types()
+            ch_to_clean = [
+                ch for ch, t in zip(raw.ch_names, ch_types)
+                if t in ("eeg", "esg")
+            ]
 
-            print(f"   Cervical channels: {len(esg_present)} | sfreq = {raw_c.info['sfreq']} Hz")
+            print(f"   Total channels: {len(raw.ch_names)} | sfreq = {raw.info['sfreq']} Hz")
+            print(f"   Channels to clean (type eeg/esg): {len(ch_to_clean)}")
             print(f"   Number of stimuli: {len(onsets)}")
 
-            # 3) PCHIP interpolation of the stimulation artifact
-            interpolate_stim_artifact(raw_c, onsets, start_ms, end_ms, n_pad=5)
+            # 3) PCHIP interpolation of the stimulation artifact on EEG + ESG
+            interpolate_stim_artifact(
+                raw,
+                onsets,
+                start_ms,
+                end_ms,
+                picks=ch_to_clean,
+                n_pad=5,
+            )
 
-            # 4) Save artifact-cleaned cervical ESG as .fif at 10 kHz
+            # 4) Save artifact-cleaned data as .fif at 10 kHz
             out_subdir = OUT_DIR / subject_id
             out_subdir.mkdir(parents=True, exist_ok=True)
 
             m_run = re.search(r"run-(\d+)", setfile.name)
             run_id = int(m_run.group(1)) if m_run else 1
 
-            out_fif = out_subdir / f"esg_noStimart_10kHz_task-{TASK_NAME}_run-{run_id:02d}.fif"
-            raw_c.save(out_fif, overwrite=True)
-            print("    Saved:", out_fif)
+            out_fif = out_subdir / f"noStimart_10kHz_task-{TASK_NAME}_run-{run_id:02d}.fif"
+            raw.save(out_fif, overwrite=True)
+            print("   Saved:", out_fif)
 
-            del raw_c, raw
+            del raw
 
-    print("\n Done: stimulation artifact interpolated for cervical ESG.")
+    print("\nFinished: stimulation artifact interpolated for EEG + ESG channels.")
 
 
 if __name__ == "__main__":
     main()
+
+
