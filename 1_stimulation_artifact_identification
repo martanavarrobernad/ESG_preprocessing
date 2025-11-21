@@ -241,7 +241,7 @@ def main():
         df = pd.DataFrame(rows)
         out_csv = CFG_WIN_CSV
         out_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out_csv, index=False, encoding="utf-8")
+        df.to_csv(out_csv, index=False, float_format="%.6f", encoding="utf-8")
         print(" Artifact windows saved to:", out_csv)
         print(df)
     else:
