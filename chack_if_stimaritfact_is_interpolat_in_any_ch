@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 21 16:56:38 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Visual check of stimulation artifact removal on a single channel.
+
+Compares ORIGINAL vs. PCHIP-cleaned (noStimart_10kHz) data for one channel:
+- loads original EEGLAB .set
+- loads cleaned .fif
+- builds epochs around stimulus onsets
+- plots average waveform around the stimulus for both versions
+"""
+
+from pathlib import Path
+import re
+
+import numpy as np
+import pandas as pd
+import mne
+import matplotlib.pyplot as plt
+
+# ================ CONFIGURATION ================
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+subject = 1
+run = 3
+task = "median"
+
+# Channel to inspect (any EEG/ESG/ECG present in both files)
+CHANNEL_NAME = "SC6"   # for example; change to any channel, e.g. "Cz", "Iz", "ECG"
+
+# Time window around stimulus (in seconds) for visualization
+TMIN = -0.01   # -10 ms
+TMAX = 0.02    #  20 ms
+
+# =============================================
+
+
+def read_events_tsv(events_tsv: Path):
+    """Return stimulus onsets (seconds) from BIDS events.tsv or None."""
+    if not events_tsv.exists():
+        return None
+
+    df = pd.read_csv(events_tsv, sep="\t")
+    if "onset" not in df.columns:
+        return None
+
+    # Prefer trial_type containing stim/pulse/median
+    if "trial_type" in df.columns:
+        mask = df["trial_type"].astype(str).str.lower().str.contains(r"(stim|pulse|median)")
+        on = df.loc[mask, "onset"].values
+        if on.size:
+            return on.astype(float)
+
+    # Fallback: most frequent value in "value"
+    if "value" in df.columns and df["value"].notna().any():
+        vv = df["value"].value_counts().idxmax()
+        return df.loc[df["value"] == vv, "onset"].values.astype(float)
+
+    return None
+
+
+def build_epochs_around_stim(raw, onsets_s, tmin, tmax, pick_name):
+    """Create epochs around stimulus onsets for a single channel."""
+    sf = raw.info["sfreq"]
+    n_samples = raw.n_times
+
+    # Build MNE-style events array from onsets
+    on_samples = np.round(onsets_s * sf).astype(int)
+    # Keep only onsets that are safely inside the data
+    mask = (on_samples + int(tmin * sf) >= 0) & (on_samples + int(tmax * sf) < n_samples)
+    on_samples = on_samples[mask]
+    if on_samples.size == 0:
+        raise RuntimeError("No valid onsets inside data range.")
+
+    events = np.column_stack([on_samples, np.zeros_like(on_samples), np.ones_like(on_samples, dtype=int)])
+
+    # Create epochs for a single channel
+    epochs = mne.Epochs(
+        raw,
+        events=events,
+        event_id={"stim": 1},
+        tmin=tmin,
+        tmax=tmax,
+        baseline=None,
+        picks=[pick_name],
+        preload=True,
+        verbose="warning",
+    )
+    return epochs
+
+
+def main():
+    subject_id = f"sub-{subject:03d}"
+
+    # Paths to original EEGLAB and cleaned FIF
+    eeg_dir = BASE / subject_id / "eeg"
+    setfile = eeg_dir / f"{subject_id}_task-{task}_run-{run:02d}_eeg.set"
+
+    cleaned_dir = BASE / "eeg_esg_10kHz_noStimart" / subject_id
+    fif_clean = cleaned_dir / f"noStimart_10kHz_task-{task}_run-{run:02d}.fif"
+
+    print("Original file :", setfile)
+    print("Cleaned  file :", fif_clean)
+
+    if not setfile.exists():
+        raise FileNotFoundError(f"Original file not found: {setfile}")
+    if not fif_clean.exists():
+        raise FileNotFoundError(f"Cleaned file not found: {fif_clean}")
+
+    # Load original
+    raw_orig = mne.io.read_raw_eeglab(setfile, preload=False, verbose="warning")
+    raw_orig.load_data()
+
+    # Load cleaned (already artifact-free for EEG+ESG)
+    raw_clean = mne.io.read_raw_fif(fif_clean, preload=False, verbose="warning")
+    raw_clean.load_data()
+
+    # Check that the channel exists in both
+    if CHANNEL_NAME not in raw_orig.ch_names:
+        raise RuntimeError(f"Channel {CHANNEL_NAME} not found in original data.")
+    if CHANNEL_NAME not in raw_clean.ch_names:
+        raise RuntimeError(f"Channel {CHANNEL_NAME} not found in cleaned data.")
+
+    # Read stimulus onsets from events.tsv
+    events_tsv = eeg_dir / f"{subject_id}_task-{task}_run-{run:02d}_events.tsv"
+    onsets = read_events_tsv(events_tsv)
+    if onsets is None or len(onsets) == 0:
+        raise RuntimeError(f"No stimulation onsets found in {events_tsv}")
+
+    print(f"Found {len(onsets)} stimulus onsets.")
+
+    # Build epochs around stim for original and cleaned data
+    epochs_orig = build_epochs_around_stim(raw_orig, onsets, TMIN, TMAX, CHANNEL_NAME)
+    epochs_clean = build_epochs_around_stim(raw_clean, onsets, TMIN, TMAX, CHANNEL_NAME)
+
+    # Compute averages
+    evoked_orig = epochs_orig.average()
+    evoked_clean = epochs_clean.average()
+
+    # Extract data and time axis (in ms)
+    t_ms = evoked_orig.times * 1000.0
+    y_orig = evoked_orig.data[0] * 1e6   # to microvolts
+    y_clean = evoked_clean.data[0] * 1e6
+
+    # Plot
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_ms, y_orig, label="Original", linewidth=1)
+    plt.plot(t_ms, y_clean, label="Cleaned (noStimart)", linewidth=1)
+    plt.axvline(0, color="k", linestyle="--", label="Stimulus")
+    plt.xlabel("Time (ms)")
+    plt.ylabel("Amplitude (µV)")
+    plt.title(f"{subject_id}, run-{run:02d}, channel {CHANNEL_NAME}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
