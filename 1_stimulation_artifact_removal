@@ -1,0 +1,247 @@
+from pathlib import Path
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import mne
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+TASK_NAME = "median"
+SUBJECTS = list(range(1, 4 + 1))
+CFG_WIN_CSV = BASE / "cfg_artifact_windows_cervical.csv"
+
+# ESG cervical channels
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6",
+]
+
+# Time window to inspect around the stimulus (in ms)
+EPOCH_VIEW_MS = (-10.0, 10.0)
+
+# ---------------------------------------------------------------------
+# Matplotlib backend: try a Qt backend to make ginput work interactively
+# ---------------------------------------------------------------------
+
+try:
+    current_backend = plt.get_backend().lower()
+    if current_backend not in ("qtagg", "qt5agg"):
+        for candidate in ("QtAgg", "Qt5Agg"):
+            try:
+                plt.switch_backend(candidate)
+                break
+            except Exception:
+                continue
+except Exception:
+    # Fallback: keep whatever backend is available
+    pass
+
+# ---------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------
+
+
+def find_subject_runs(rawdir: Path, subject: int, task: str):
+    """Return a sorted list of .set files for a subject and task."""
+    subject_id = f"sub-{subject:03d}"
+    eeg_dir = rawdir / subject_id
+    if (eeg_dir / "eeg").exists():
+        eeg_dir = eeg_dir / "eeg"
+    return sorted(eeg_dir.glob(f"{subject_id}_task-{task}_run-*_eeg.set"))
+
+
+def read_events_tsv(events_tsv: Path):
+    """
+    Read onset times (in seconds) from the *_events.tsv file.
+    Returns a 1D numpy array of onsets or None if not found.
+    """
+    if not events_tsv.exists():
+        return None
+
+    df = pd.read_csv(events_tsv, sep="\t")
+    if "onset" not in df.columns:
+        return None
+
+    # Use trial_type if present and keep rows that look like stim/pulse/median
+    if "trial_type" in df.columns:
+        mask = df["trial_type"].astype(str).str.lower().str.contains(
+            r"(stim|pulse|median)"
+        )
+        on = df.loc[mask, "onset"].values
+        if on.size:
+            return on.astype(float)
+
+    return None
+
+
+def build_cerv_avg_incremental(setfiles, esg_names, epoch_ms=(-20.0, 20.0)):
+    """
+    Build an incremental ESG cervical average around each stimulus.
+
+    Parameters
+    ----------
+    setfiles : list of Path
+        EEGLAB .set files for one subject (multiple runs).
+    esg_names : list of str
+        List of cervical ESG channel names to look for.
+    epoch_ms : tuple (start_ms, end_ms)
+        Time window around the event in milliseconds.
+
+    Returns
+    -------
+    t_ms : 1D array (ms)
+        Time axis relative to the event.
+    avg : 1D array (µV)
+        Grand average across all selected channels and all valid trials.
+    n_trials : int
+        Number of trials included in the average.
+    """
+    t_ms = None
+    avg = None
+    n_trials = 0
+
+    for setfile in setfiles:
+        base = setfile.name[:-8]
+        events_tsv = setfile.with_name(f"{base}_events.tsv")
+        evs = read_events_tsv(events_tsv)
+        if evs is None or len(evs) == 0:
+            continue
+
+        # Load only metadata; data is read on demand
+        raw = mne.io.read_raw_eeglab(setfile, preload=False, verbose=False)
+
+        # Keep only cervical channels present in the file
+        esg_present = [ch for ch in esg_names if ch in raw.ch_names]
+        if not esg_present:
+            del raw
+            continue
+
+        raw_c = raw.copy().pick(esg_present, verbose=False)
+        sf = raw_c.info["sfreq"]
+
+        s0 = int(round(epoch_ms[0] / 1000 * sf))
+        s1 = int(round(epoch_ms[1] / 1000 * sf))
+        win_len = s1 - s0 + 1
+
+        if t_ms is None:
+            t_ms = np.arange(win_len) / sf * 1000 + epoch_ms[0]
+            avg = np.zeros(win_len, dtype=float)
+
+        n_samples = raw_c.n_times
+        ev_samples = np.round(evs * sf).astype(int)
+
+        for idx in ev_samples:
+            i0 = idx + s0
+            i1 = idx + s1
+            if i0 < 0 or i1 >= n_samples:
+                continue
+
+            # Read only this segment and average across channels
+            seg = raw_c.get_data(start=i0, stop=i1 + 1)  # shape (n_ch, win_len)
+            seg_mean = seg.mean(axis=0) * 1e6           # convert to microvolts
+            avg += seg_mean
+            n_trials += 1
+
+        del raw_c, raw
+
+    if n_trials == 0:
+        return None, None, 0
+
+    avg /= n_trials
+    return t_ms, avg, n_trials
+
+
+def ginput_two_points_plot(t_ms, y_uv, subject_id):
+    """
+    Open an interactive figure, wait for two mouse clicks,
+    and return (start_ms, end_ms) of the artifact window.
+    """
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(t_ms, y_uv, lw=1)
+    ax.axvline(0, color="r", ls="--", label="stimulus")
+    ax.set_title(f"{subject_id} — click START and END of artifact (ms)")
+    ax.set_xlabel("Time (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.show()
+
+    try:
+        pts = plt.ginput(2, timeout=-1)
+    except Exception:
+        pts = plt.ginput(2, timeout=0)
+
+    plt.close(fig)
+
+    if not pts or len(pts) < 2:
+        return None, None
+
+    xs = sorted(p[0] for p in pts)
+    return xs[0], xs[1]
+
+
+# ---------------------------------------------------------------------
+# Main script
+# ---------------------------------------------------------------------
+
+
+def main():
+    if not BASE.exists():
+        print(f" BASE path does not exist:\n{BASE}\nPlease adjust BASE at the top.")
+        sys.exit(1)
+
+    rows = []
+    for s in SUBJECTS:
+        subject_id = f"sub-{s:03d}"
+        setfiles = find_subject_runs(BASE, s, TASK_NAME)
+        if not setfiles:
+            print(f"{subject_id}: no runs found -> skipping")
+            continue
+
+        print(f"{subject_id}: building cervical ESG average (RAM-friendly)...")
+        t_ms, y_uv, n_trials = build_cerv_avg_incremental(
+            setfiles, ESG_CERV, EPOCH_VIEW_MS
+        )
+
+        if t_ms is None:
+            print(f"{subject_id}: no events or no cervical ESG -> skipping")
+            continue
+
+        print(f"{subject_id}: {n_trials} stimuli included in the average")
+
+        start_ms, end_ms = ginput_two_points_plot(t_ms, y_uv, subject_id)
+        if start_ms is None:
+            print(f"{subject_id}: no window selected -> skipping")
+            continue
+
+        print(f"{subject_id}: selected window {start_ms:.2f} – {end_ms:.2f} ms")
+        rows.append(
+            {
+                "subject": s,
+                "start_cerv_ms": start_ms,
+                "end_cerv_ms": end_ms,
+            }
+        )
+
+    # Save artifact windows to CSV
+    if rows:
+        df = pd.DataFrame(rows)
+        out_csv = CFG_WIN_CSV
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_csv, index=False, encoding="utf-8")
+        print(" Artifact windows saved to:", out_csv)
+        print(df)
+    else:
+        print(" No windows were saved (no selection).")
+
+
+if __name__ == "__main__":
+    main()
