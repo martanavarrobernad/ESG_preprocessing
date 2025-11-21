@@ -1,0 +1,64 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 21 15:55:56 2025
+
+@author: martanavarrobernad
+
+Interactive inspection of cervical ESG channels from a RAW EEG/ESG/EEGLAB/MEG file.
+
+Loads a file without preloading (RAM-efficient) and opens an interactive MNE browser
+restricted to cervical ESG channels.
+
+Adjust RAW_FILE to inspect any dataset.
+"""
+
+from pathlib import Path
+import mne
+
+# === List of cervical ESG channels ===
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6"
+]
+
+# ================= CONFIGURATION (edit this) =================
+RAW_FILE = Path(
+    r"C:\Users\navar\Desktop\example_file.fif"   # <-- change to any file you want to inspect
+)
+
+# ================= 1) LOAD WITHOUT PRELOAD ==================
+print(f"Loading: {RAW_FILE}")
+
+suffix = RAW_FILE.suffix.lower()
+if suffix == ".fif":
+    raw = mne.io.read_raw_fif(RAW_FILE, preload=False, verbose="warning")
+elif suffix == ".set":
+    raw = mne.io.read_raw_eeglab(RAW_FILE, preload=False, verbose="warning")
+else:
+    raise ValueError(f"Unsupported file extension: {suffix}")
+
+print(raw)  # summary: n_channels, sfreq, etc.
+
+# ================= 2) SELECT CHANNELS TO DISPLAY ==================
+picks_esg = [ch for ch in ESG_CERV if ch in raw.ch_names]
+
+print(f"\nDisplaying {len(picks_esg)} ESG channels:")
+print(picks_esg)
+
+# ================= 3) INTERACTIVE PLOT ==================
+raw.plot(
+    picks=picks_esg,
+    duration=4.0,            # width of time window in seconds
+    start=0.0,               # start time for visualization
+    n_channels=min(len(picks_esg), 20),
+    block=True               # keeps the window open until closed manually
+)
+
+"""
+Instructions:
+- Scroll horizontally using the mouse wheel or bottom scrollbar.
+- Double-click a trace to auto-scale it.
+- Use the "Scale" button to adjust amplitude.
+- Use "Go to" to jump to a specific time.
+"""
