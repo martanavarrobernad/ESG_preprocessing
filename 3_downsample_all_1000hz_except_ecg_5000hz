@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Nov 21 17:07:41 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Downsample all channels from 10 kHz artifact-cleaned data:
+- ECG channels -> 5000 Hz
+- All other channels -> 1000 Hz
+
+Input: noStimart_10kHz_task-<task>_run-XX.fif
+Output: noStimart_mixedSR_task-<task>_run-XX.fif
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import mne
+
+
+# ===================== PATHS =====================
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+IN_DIR  = BASE / "eeg_esg_10kHz_noStimart"       # input files (10 kHz, artifact-free)
+OUT_DIR = BASE / "eeg_esg_mixedSR_noStimart"     # output (ECG 5 kHz, others 1 kHz)
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+TASK_NAME = "median"
+
+
+# ===================== HELPERS =====================
+
+def read_events_tsv(events_tsv: Path):
+    """Read BIDS events file and return DataFrame with onset/duration/trial_type."""
+    if not events_tsv.exists():
+        return None
+
+    df = pd.read_csv(events_tsv, sep="\t")
+    if "onset" not in df.columns:
+        return None
+
+    # Prefer trial_type
+    if "trial_type" in df.columns:
+        mask = df["trial_type"].astype(str).str.lower().str.contains(r"(stim|pulse|median)")
+        if mask.any():
+            return df.loc[mask, ["onset", "duration", "trial_type"]]
+
+    # fallback: most frequent value
+    if "value" in df.columns:
+        vv = df["value"].value_counts().idxmax()
+        mask = df["value"] == vv
+        return df.loc[mask, ["onset", "duration"]].assign(trial_type="stim")
+
+    return None
+
+
+# ===================== MAIN DOWNSAMPLER =====================
+
+def downsample_all(subjects):
+    for s in subjects:
+        subject_id = f"sub-{s:03d}"
+        in_subdir = IN_DIR / subject_id
+
+        if not in_subdir.exists():
+            print(f"{subject_id}: input directory missing → skipping.")
+            continue
+
+        fif_files = sorted(in_subdir.glob(f"noStimart_10kHz_task-{TASK_NAME}_run-*.fif"))
+        if not fif_files:
+            print(f"{subject_id}: no input FIF files found → skipping.")
+            continue
+
+        print(f"\n===== {subject_id} =====")
+
+        for fif in fif_files:
+            print(f"\n  Loading {fif.name}")
+
+            # Determine run number
+            m = re.search(r"run-(\d+)", fif.name)
+            run = int(m.group(1)) if m else 1
+
+            # Output
+            out_subdir = OUT_DIR / subject_id
+            out_subdir.mkdir(exist_ok=True, parents=True)
+            out_name = f"noStimart_mixedSR_task-{TASK_NAME}_run-{run:02d}.fif"
+            out_path = out_subdir / out_name
+
+            if out_path.exists():
+                print(f"   Output already exists → skipping.")
+                continue
+
+            # ---------------- LOAD ----------------
+            raw = mne.io.read_raw_fif(fif, preload=False, verbose="warning")
+            raw.load_data()
+            raw._data = raw._data.astype(np.float32)
+            sf0 = raw.info["sfreq"]
+            print(f"   Original sfreq = {sf0} Hz")
+
+            # ---------------- ANNOTATIONS ----------------
+            events_tsv = (
+                BASE
+                / subject_id
+                / "eeg"
+                / f"{subject_id}_task-{TASK_NAME}_run-{run:02d}_events.tsv"
+            )
+
+            if events_tsv.exists():
+                df_ev = read_events_tsv(events_tsv)
+                if df_ev is not None and not df_ev.empty:
+                    ann = mne.Annotations(
+                        onset=df_ev["onset"].to_numpy(),
+                        duration=df_ev["duration"].fillna(0).to_numpy(),
+                        description=df_ev["trial_type"].astype(str).tolist(),
+                    )
+                    raw.set_annotations(ann)
+                    print(f"   Added {len(ann)} annotations")
+                else:
+                    print("   No valid events in events.tsv")
+            else:
+                print("   No events.tsv found → no annotations")
+
+            # ---------------- SPLIT CHANNELS ----------------
+            ch_types = raw.get_channel_types()
+            ecg_ch = [ch for ch, t in zip(raw.ch_names, ch_types) if t == "ecg"]
+            other_ch = [ch for ch, t in zip(raw.ch_names, ch_types) if t != "ecg"]
+
+            print(f"   ECG channels: {ecg_ch}")
+            print(f"   Other channels: {len(other_ch)}")
+
+            # Create separate Raw objects
+            raw_ecg = raw.copy().pick(ecg_ch)
+            raw_other = raw.copy().pick(other_ch)
+
+            # ---------------- RESAMPLE ----------------
+            print("   Resampling ECG → 5000 Hz ...")
+            raw_ecg.resample(5000, npad="auto")
+
+            print("   Resampling OTHER channels → 1000 Hz ...")
+            raw_other.resample(1000, npad="auto")
+
+            # ---------------- MERGE BACK ----------------
+            raw_out = mne.concatenate_raws([raw_other, raw_ecg])
+
+            # Preserve original metadata if needed
+            raw_out.set_annotations(raw.annotations)
+
+            # ---------------- SAVE ----------------
+            raw_out.save(out_path, overwrite=True)
+            print(f"   Saved: {out_path}")
+
+            del raw, raw_ecg, raw_other, raw_out
+
+    print("\n=== COMPLETED: Mixed 1000/5000 Hz downsampling ===")
+
+
+# ===================== RUN =====================
+
+if __name__ == "__main__":
+    downsample_all(range(1, 10))
