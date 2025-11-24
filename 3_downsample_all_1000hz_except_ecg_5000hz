@@ -1,34 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Nov 21 17:07:41 2025
+Created on Fri Nov 21 18:35:06 2025
 
 @author: navar
 """
 
 # -*- coding: utf-8 -*-
 """
-Downsample all channels from 10 kHz artifact-cleaned data:
-- ECG channels -> 5000 Hz
-- All other channels -> 1000 Hz
+Downsample artifact-free data from 10 kHz into:
+- ALL channels at 1000 Hz (using memory-efficient per-channel decimation)
+- ECG channels at 5000 Hz (separate file, using MNE resample)
 
-Input: noStimart_10kHz_task-<task>_run-XX.fif
-Output: noStimart_mixedSR_task-<task>_run-XX.fif
+Input (per run):
+    eeg_esg_10kHz_noStimart/sub-XXX/noStimart_10kHz_task-<TASK>_run-XX.fif
+
+Output (per run):
+    eeg_esg_1000Hz_noStimart/sub-XXX/noStimart_sr1000Hz_all_task-<TASK>_run-XX.fif
+    ecg_5000Hz_noStimart/sub-XXX/noStimart_sr5000Hz_ecg_task-<TASK>_run-XX.fif
 """
 
 from pathlib import Path
 import re
+
 import numpy as np
 import pandas as pd
 import mne
-
+from scipy.signal import decimate
 
 # ===================== PATHS =====================
 
 BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 
-IN_DIR  = BASE / "eeg_esg_10kHz_noStimart"       # input files (10 kHz, artifact-free)
-OUT_DIR = BASE / "eeg_esg_mixedSR_noStimart"     # output (ECG 5 kHz, others 1 kHz)
-OUT_DIR.mkdir(exist_ok=True, parents=True)
+IN_DIR   = BASE / "eeg_esg_10kHz_noStimart"       # 10 kHz, artifact-free (all channels)
+OUT_ALL  = BASE / "eeg_esg_1000Hz_noStimart"      # all channels at 1000 Hz
+OUT_ECG  = BASE / "ecg_5000Hz_noStimart"          # ECG-only at 5000 Hz
+OUT_ALL.mkdir(exist_ok=True, parents=True)
+OUT_ECG.mkdir(exist_ok=True, parents=True)
 
 TASK_NAME = "median"
 
@@ -36,7 +43,10 @@ TASK_NAME = "median"
 # ===================== HELPERS =====================
 
 def read_events_tsv(events_tsv: Path):
-    """Read BIDS events file and return DataFrame with onset/duration/trial_type."""
+    """
+    Read BIDS events.tsv and return DataFrame with onset, duration, trial_type
+    restricted to stimulation events.
+    """
     if not events_tsv.exists():
         return None
 
@@ -44,14 +54,14 @@ def read_events_tsv(events_tsv: Path):
     if "onset" not in df.columns:
         return None
 
-    # Prefer trial_type
+    # Prefer trial_type with stim/pulse/median
     if "trial_type" in df.columns:
         mask = df["trial_type"].astype(str).str.lower().str.contains(r"(stim|pulse|median)")
         if mask.any():
             return df.loc[mask, ["onset", "duration", "trial_type"]]
 
-    # fallback: most frequent value
-    if "value" in df.columns:
+    # Fallback: most frequent "value"
+    if "value" in df.columns and df["value"].notna().any():
         vv = df["value"].value_counts().idxmax()
         mask = df["value"] == vv
         return df.loc[mask, ["onset", "duration"]].assign(trial_type="stim")
@@ -59,106 +69,177 @@ def read_events_tsv(events_tsv: Path):
     return None
 
 
-# ===================== MAIN DOWNSAMPLER =====================
+def downsample_all_and_ecg(subjects, sfreq_all=1000.0, sfreq_ecg=5000.0):
+    """
+    For each subject and run:
+    - Downsample all channels to sfreq_all (e.g., 1000 Hz) and save.
+    - Downsample ECG channels to sfreq_ecg (e.g., 5000 Hz) and save separately.
 
-def downsample_all(subjects):
+    Parameters
+    ----------
+    subjects : iterable of int
+        Subject indices (e.g. range(1, 10)).
+    sfreq_all : float
+        Target sampling rate for all channels (Hz).
+    sfreq_ecg : float
+        Target sampling rate for ECG-only file (Hz).
+    """
     for s in subjects:
         subject_id = f"sub-{s:03d}"
         in_subdir = IN_DIR / subject_id
-
         if not in_subdir.exists():
-            print(f"{subject_id}: input directory missing → skipping.")
+            print(f"{subject_id}: input directory missing -> skipping.")
             continue
 
         fif_files = sorted(in_subdir.glob(f"noStimart_10kHz_task-{TASK_NAME}_run-*.fif"))
         if not fif_files:
-            print(f"{subject_id}: no input FIF files found → skipping.")
+            print(f"{subject_id}: no input FIF files found -> skipping.")
             continue
 
         print(f"\n===== {subject_id} =====")
 
         for fif in fif_files:
-            print(f"\n  Loading {fif.name}")
+            print(f"\n  Loading (metadata only) {fif.name}")
 
             # Determine run number
             m = re.search(r"run-(\d+)", fif.name)
             run = int(m.group(1)) if m else 1
 
-            # Output
-            out_subdir = OUT_DIR / subject_id
-            out_subdir.mkdir(exist_ok=True, parents=True)
-            out_name = f"noStimart_mixedSR_task-{TASK_NAME}_run-{run:02d}.fif"
-            out_path = out_subdir / out_name
+            # Output paths
+            out_all_subdir = OUT_ALL / subject_id
+            out_ecg_subdir = OUT_ECG / subject_id
+            out_all_subdir.mkdir(exist_ok=True, parents=True)
+            out_ecg_subdir.mkdir(exist_ok=True, parents=True)
 
-            if out_path.exists():
-                print(f"   Output already exists → skipping.")
+            out_all_name = f"noStimart_sr{int(sfreq_all)}Hz_all_task-{TASK_NAME}_run-{run:02d}.fif"
+            out_ecg_name = f"noStimart_sr{int(sfreq_ecg)}Hz_ecg_task-{TASK_NAME}_run-{run:02d}.fif"
+
+            out_all_path = out_all_subdir / out_all_name
+            out_ecg_path = out_ecg_subdir / out_ecg_name
+
+            # Skip if both outputs already exist
+            if out_all_path.exists() and out_ecg_path.exists():
+                print("   Both outputs already exist -> skipping run.")
                 continue
 
-            # ---------------- LOAD ----------------
-            raw = mne.io.read_raw_fif(fif, preload=False, verbose="warning")
-            raw.load_data()
-            raw._data = raw._data.astype(np.float32)
-            sf0 = raw.info["sfreq"]
-            print(f"   Original sfreq = {sf0} Hz")
+            # --- Read info & channel types without preloading data ---
+            raw_info = mne.io.read_raw_fif(fif, preload=False, verbose="error")
+            sf0 = raw_info.info["sfreq"]
+            ch_names = raw_info.ch_names
+            ch_types = raw_info.get_channel_types()
+            print(f"   Original sfreq: {sf0} Hz | n_channels: {len(ch_names)}")
 
-            # ---------------- ANNOTATIONS ----------------
-            events_tsv = (
-                BASE
-                / subject_id
-                / "eeg"
-                / f"{subject_id}_task-{TASK_NAME}_run-{run:02d}_events.tsv"
-            )
+            if sf0 <= sfreq_all:
+                print("   Original sfreq <= target sfreq_all: no downsampling needed (skipping).")
+                continue
 
-            if events_tsv.exists():
-                df_ev = read_events_tsv(events_tsv)
+            # Identify ECG channels
+            ecg_ch = [ch for ch, t in zip(ch_names, ch_types) if t == "ecg"]
+            print(f"   ECG channels: {ecg_ch}")
+
+            # Paths to events.tsv
+            eeg_dir = BASE / subject_id / "eeg"
+            events_tsv = eeg_dir / f"{subject_id}_task-{TASK_NAME}_run-{run:02d}_events.tsv"
+            df_ev = read_events_tsv(events_tsv) if events_tsv.exists() else None
+
+            # ===================== 1) ALL CHANNELS @ sfreq_all (per-channel decimate) =====================
+            if not out_all_path.exists():
+                print(f"   Downsampling ALL channels -> {sfreq_all} Hz (memory-efficient)...")
+
+                # Re-open raw with preload=False to stream data
+                raw_all_src = mne.io.read_raw_fif(fif, preload=False, verbose="warning")
+                sf0 = raw_all_src.info["sfreq"]
+                decim_factor = int(round(sf0 / sfreq_all))
+                if sf0 / decim_factor != sfreq_all:
+                    raise RuntimeError(f"Non-integer decimation factor: {sf0} -> {sfreq_all} Hz")
+
+                n_ch = len(raw_all_src.ch_names)
+
+                data_ds = None
+
+                for idx, ch in enumerate(raw_all_src.ch_names):
+                    # Read one channel as float64
+                    x = raw_all_src.get_data(picks=[ch], verbose="error")[0]
+                    # Decimate (FIR, zero-phase)
+                    x_ds = decimate(x, decim_factor, ftype="fir", zero_phase=True)
+                    x_ds = x_ds.astype(np.float32)
+
+                    if data_ds is None:
+                        n_times_ds = x_ds.shape[0]
+                        data_ds = np.empty((n_ch, n_times_ds), dtype=np.float32)
+                        print(f"   Decimated length: {n_times_ds} samples per channel")
+
+                    data_ds[idx, :] = x_ds
+
+                # Build new Info from scratch with target sfreq
+                info_all = mne.create_info(
+                    ch_names=raw_all_src.ch_names,
+                    sfreq=sfreq_all,
+                    ch_types=raw_all_src.get_channel_types()
+                )
+
+                # Try to copy montage if present
+                try:
+                    montage = raw_all_src.get_montage()
+                    if montage is not None:
+                        info_all.set_montage(montage)
+                except Exception:
+                    pass
+
+                # Build RawArray with downsampled data and new info
+                raw_all = mne.io.RawArray(data_ds, info_all)
+
+                # Add annotations (onset in seconds stays valid)
                 if df_ev is not None and not df_ev.empty:
                     ann = mne.Annotations(
                         onset=df_ev["onset"].to_numpy(),
                         duration=df_ev["duration"].fillna(0).to_numpy(),
                         description=df_ev["trial_type"].astype(str).tolist(),
                     )
-                    raw.set_annotations(ann)
-                    print(f"   Added {len(ann)} annotations")
+                    raw_all.set_annotations(ann)
+                    print(f"   Added {len(ann)} annotations to ALL-channels file.")
                 else:
-                    print("   No valid events in events.tsv")
+                    print("   No annotations added to ALL-channels file.")
+
+                raw_all.save(out_all_path, overwrite=True)
+                print(f"   Saved ALL channels at {sfreq_all} Hz: {out_all_path}")
+                del raw_all, raw_all_src, data_ds
+
             else:
-                print("   No events.tsv found → no annotations")
+                print(f"   ALL-channels file already exists: {out_all_path}")
 
-            # ---------------- SPLIT CHANNELS ----------------
-            ch_types = raw.get_channel_types()
-            ecg_ch = [ch for ch, t in zip(raw.ch_names, ch_types) if t == "ecg"]
-            other_ch = [ch for ch, t in zip(raw.ch_names, ch_types) if t != "ecg"]
+            # ===================== 2) ECG-ONLY @ sfreq_ecg (normal resample, few channels) =====================
+            if ecg_ch and not out_ecg_path.exists():
+                print(f"   Downsampling ECG-only -> {sfreq_ecg} Hz ...")
 
-            print(f"   ECG channels: {ecg_ch}")
-            print(f"   Other channels: {len(other_ch)}")
+                # Load only ECG channels, preload=True is fine (very few channels)
+                raw_ecg = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+                raw_ecg.pick(ecg_ch)
 
-            # Create separate Raw objects
-            raw_ecg = raw.copy().pick(ecg_ch)
-            raw_other = raw.copy().pick(other_ch)
+                # Add annotations
+                if df_ev is not None and not df_ev.empty:
+                    ann = mne.Annotations(
+                        onset=df_ev["onset"].to_numpy(),
+                        duration=df_ev["duration"].fillna(0).to_numpy(),
+                        description=df_ev["trial_type"].astype(str).tolist(),
+                    )
+                    raw_ecg.set_annotations(ann)
+                    print(f"   Added {len(ann)} annotations to ECG file.")
 
-            # ---------------- RESAMPLE ----------------
-            print("   Resampling ECG → 5000 Hz ...")
-            raw_ecg.resample(5000, npad="auto")
+                # Resample ECG to sfreq_ecg (few channels -> low memory)
+                raw_ecg.resample(sfreq_ecg, npad="auto")
+                raw_ecg.save(out_ecg_path, overwrite=True)
+                print(f"   Saved ECG-only at {sfreq_ecg} Hz: {out_ecg_path}")
+                del raw_ecg
 
-            print("   Resampling OTHER channels → 1000 Hz ...")
-            raw_other.resample(1000, npad="auto")
+            elif not ecg_ch:
+                print("   No ECG channels found -> no ECG file saved.")
+            else:
+                print(f"   ECG-only file already exists: {out_ecg_path}")
 
-            # ---------------- MERGE BACK ----------------
-            raw_out = mne.concatenate_raws([raw_other, raw_ecg])
+    print("\n=== COMPLETED: ALL channels @ 1000 Hz (per-channel decimate) and ECG-only @ 5000 Hz ===")
 
-            # Preserve original metadata if needed
-            raw_out.set_annotations(raw.annotations)
-
-            # ---------------- SAVE ----------------
-            raw_out.save(out_path, overwrite=True)
-            print(f"   Saved: {out_path}")
-
-            del raw, raw_ecg, raw_other, raw_out
-
-    print("\n=== COMPLETED: Mixed 1000/5000 Hz downsampling ===")
-
-
-# ===================== RUN =====================
 
 if __name__ == "__main__":
-    downsample_all(range(1, 10))
+    # Adjust subject range as needed
+    downsample_all_and_ecg(range(1, 10), sfreq_all=1000.0, sfreq_ecg=5000.0)
