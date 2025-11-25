@@ -1,0 +1,66 @@
+# -*- coding: utf-8 -*-
+"""
+Interactive inspection of EEG channels from a RAW EEG/ESG/EEGLAB/MEG file.
+
+Loads a file without preloading (RAM-efficient) and opens an interactive MNE browser
+restricted to EEG channels (based on channel type).
+
+Use this to compare how the cardiac artefact looks in EEG vs cervical ESG.
+
+Adjust RAW_FILE to inspect any dataset.
+"""
+
+from pathlib import Path
+import mne
+
+# ================= CONFIGURATION (edit this) =================
+RAW_FILE = Path(
+    r"C:\Users\navar\Desktop\ds004388-1.0.0\sub-001\eeg\sub-001_task-median_run-03_eeg.set"
+)
+
+# ================= 1) LOAD WITHOUT PRELOAD ==================
+print(f"Loading: {RAW_FILE}")
+
+suffix = RAW_FILE.suffix.lower()
+if suffix == ".fif":
+    raw = mne.io.read_raw_fif(RAW_FILE, preload=False, verbose="warning")
+elif suffix == ".set":
+    raw = mne.io.read_raw_eeglab(RAW_FILE, preload=False, verbose="warning")
+else:
+    raise ValueError(f"Unsupported file extension: {suffix}")
+
+print(raw)  # summary: n_channels, sfreq, etc.
+
+# ================= 2) SELECT EEG CHANNELS ==================
+ch_types = raw.get_channel_types()
+picks_eeg = [ch for ch, t in zip(raw.ch_names, ch_types) if t == "eeg"]
+
+if not picks_eeg:
+    raise RuntimeError("No EEG channels found in this file.")
+
+print(f"\nDisplaying {len(picks_eeg)} EEG channels:")
+print(picks_eeg)
+
+# If you want to limit how many EEG channels are shown at once, you can slice:
+# picks_eeg = picks_eeg[:32]
+
+# ================= 3) INTERACTIVE PLOT ==================
+raw.plot(
+    picks=picks_eeg,
+    duration=4.0,             # width of time window in seconds
+    start=0.0,                # start time for visualization
+    n_channels=min(len(picks_eeg), 20),
+    block=True                # keeps the window open until closed manually
+)
+
+"""
+Instructions:
+- Scroll horizontally using the mouse wheel or the bottom scrollbar.
+- Double-click a trace to auto-scale it.
+- Use the "Scale" button to adjust amplitude.
+- Use "Go to" to jump to a specific time.
+
+Tip:
+Open this script (EEG) and the cervical ESG script on the *same subject and run*
+to visually compare how the cardiac artefact appears in EEG vs ESG channels.
+"""
