@@ -1,0 +1,654 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Dec  2 17:59:10 2025
+
+@author: navar
+"""
+
+# ============================================================
+#  DETECCIÓN DE R-PEAKS + OBS (PCA-OBS de MNE) A 1000 Hz
+# ============================================================
+
+# Si lo necesitas:
+# pip install mne numpy pandas
+
+from pathlib import Path
+import re
+from collections import deque
+
+import numpy as np
+import pandas as pd
+import mne
+from mne.preprocessing import apply_pca_obs
+
+# ============================================================
+#  RUTAS Y PARÁMETROS BÁSICOS
+# ============================================================
+
+# Ajusta esta ruta a tu carpeta ds004388-1.0.0
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+EEG_ESG_1000_NOSTIM_DIR = BASE / "eeg_esg_1000Hz_noStimart"
+ECG_5000_NOSTIM_DIR = BASE / "ecg_5000Hz_noStimart"
+
+RPEAKS_DIR = BASE / "rpeaks_christov_obs"
+RPEAKS_DIR.mkdir(exist_ok=True, parents=True)
+
+ESG_ECGCLEAN_DIR = BASE / "esg_1000Hz_ecgclean_obs"
+ESG_ECGCLEAN_DIR.mkdir(exist_ok=True, parents=True)
+
+# (Opcional) guardar ECG 1000 Hz con anotaciones de R-peaks para inspección
+ECG1K_RPEAKS_DIR = BASE / "ecg_5000Hz_rpeaks"
+ECG1K_RPEAKS_DIR.mkdir(exist_ok=True, parents=True)
+
+TASK_NAME = "median"
+SUBJECTS = range(1, 10)   # sub-001 .. sub-009
+
+# Ajusta si tu canal ECG tiene otro nombre (p.ej. "ECG1", "ECG2", etc.)
+ECG_CHANNEL_NAME = "ECG"
+
+# Lista de canales ESG que quieres limpiar con OBS
+ESG_CHANNELS = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6"
+]
+
+# ============================================================
+#  HELPERS PARA BUSCAR ARCHIVOS Y GUARDAR TSV
+# ============================================================
+
+def find_eeg_esg_1000_nostim_runs(subject: int):
+    """
+    Busca los ficheros:
+      eeg_esg_1000Hz_noStimart/sub-001/noStimart_sr1000Hz_all_task-median_run-03.fif
+    El número de run puede ser 02, 03, 05, 07, 09, etc. (no necesariamente consecutivos).
+    """
+    subject_id = f"sub-{subject:03d}"
+    subj_dir = EEG_ESG_1000_NOSTIM_DIR / subject_id
+    return sorted(subj_dir.glob(f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*.fif"))
+
+def find_ecg_5000_nostim_runs(subject: int):
+    """
+    Busca los ficheros ECG a 5000 Hz tipo:
+      ecg_5000Hz_noStimart/sub-001/noStimart_sr5000Hz_ecg_task-median_run-03.fif
+    El número de run puede ser 02, 03, 05, 07, 09, etc.
+    """
+    subject_id = f"sub-{subject:03d}"
+    subj_dir = ECG_5000_NOSTIM_DIR / subject_id
+    return sorted(subj_dir.glob(f"noStimart_sr5000Hz_ecg_task-{TASK_NAME}_run-*.fif"))
+
+def rpeaks_tsv_path(subject: int, run: int):
+    subject_id = f"sub-{subject:03d}"
+    return RPEAKS_DIR / f"{subject_id}_task-{TASK_NAME}_run-{run:02d}_rpeaks.tsv"
+
+def load_rpeaks_for_run(subject: int, run: int):
+    """
+    Carga los tiempos de R-peaks (onset_sec) desde el TSV correspondiente.
+    """
+    tsv = rpeaks_tsv_path(subject, run)
+    if not tsv.exists():
+        print(f"   ❌ No existe TSV de R-peaks: {tsv.name}")
+        return np.array([])
+    df = pd.read_csv(tsv, sep="\t")
+    if "onset_sec" not in df.columns:
+        raise RuntimeError(f"{tsv} no tiene columna 'onset_sec'")
+    return df["onset_sec"].to_numpy(dtype=float)
+
+# ============================================================
+#  A1. PREPROCESADO ECG NIAZY-CHRISTOV (7–40 Hz, 28 ms, k-TEO)
+# ============================================================
+
+def moving_average(signal, win_samples):
+    kernel = np.ones(win_samples) / win_samples
+    return np.convolve(signal, kernel, mode="same")
+
+def k_teager_energy(x, fs, fd=10.0):
+    """
+    k-Teager Energy Operator:
+    X(n) = max( x[n]^2 - x[n-k]*x[n+k], 0 )
+    con k = fs / (4*fd)
+    """
+    k = int(fs / (4.0 * fd))
+    if k < 1:
+        k = 1
+    N = len(x)
+    X = np.zeros_like(x)
+    for n in range(k, N - k):
+        val = x[n] ** 2 - x[n - k] * x[n + k]
+        X[n] = val if val > 0 else 0.0
+    return X
+
+def ecg_preprocess_niazy_christov(raw, ecg_ch="ECG"):
+    """
+    Niazy/Christov-style preprocessing sobre ECG a 1000 Hz:
+
+    1) Filtro pasa-banda 7–40 Hz
+    2) Media móvil 28 ms
+    3) k-TEO (fd ≈ 10 Hz) -> "complex lead" Y(t)
+
+    Devuelve:
+      Y: "complex lead" (energía)
+      fs: frecuencia de muestreo
+      ecg: señal ECG original
+    """
+    sfreq = raw.info["sfreq"]
+    if ecg_ch not in raw.ch_names:
+        raise RuntimeError(f"Canal ECG {ecg_ch} no encontrado en raw.ch_names")
+
+    ecg = raw.copy().pick_channels([ecg_ch]).get_data()[0]
+
+    # 1) Filtro pasa-banda 7–40 Hz
+    ecg_filt = mne.filter.filter_data(
+        ecg, sfreq=sfreq, l_freq=7.0, h_freq=40.0, verbose="ERROR"
+    )
+
+    # 2) Media móvil 28 ms
+    win_samples = int(0.028 * sfreq)
+    if win_samples < 1:
+        win_samples = 1
+    ecg_ma = moving_average(ecg_filt, win_samples)
+
+    # 3) k-TEO (complex lead alternativa)
+    X = k_teager_energy(ecg_ma, fs=sfreq, fd=10.0)
+    Y = np.abs(X)
+
+    return Y, sfreq, ecg
+
+# ============================================================
+#  A2. DETECTOR QRS CON UMBRAL M+F+R (Christov-style)
+# ============================================================
+
+def detect_rpeaks_christov_MFR(raw, ecg_ch="ECG"):
+    """
+    Detección de QRS (Christov-style con k-TEO) sobre ECG a 1000 Hz:
+
+      - ECG preprocesado con 7–40 Hz, 28 ms, k-TEO  -> Y(t)
+      - Umbral adaptativo MFR = M + F + R
+      - Período refractario 200 ms
+
+    Devuelve:
+      rpeaks_idx: índices de muestra (detección inicial)
+      rpeaks_sec: tiempos en segundos (detección inicial)
+    """
+    Y, fs, ecg = ecg_preprocess_niazy_christov(raw, ecg_ch=ecg_ch)
+    N = len(Y)
+
+    # ============ Inicialización M (steep-slope) ============
+    init_samps = min(int(5 * fs), N)  # primeros 5 s
+    if init_samps < 2 * fs:
+        raise RuntimeError("Registro ECG demasiado corto para inicializar M")
+
+    M0 = 0.6 * np.max(Y[:init_samps])  # 60% del máximo en los primeros 5 s
+    MM = [M0] * 5                      # buffer de 5 valores M5
+    M_static = M0                      # valor medio de MM
+
+    # ============ Inicialización F (integrating threshold) ============
+    win350 = int(0.35 * fs)           # 350 ms
+    if win350 < 1:
+        win350 = 1
+    F = float(np.mean(Y[:win350]))    # media inicial de Y en 350 ms
+
+    # bloques de 50 ms para actualizar F
+    block50 = int(0.05 * fs)
+    if block50 < 1:
+        block50 = 1
+    F_block_max = deque(maxlen=7)     # 7 bloques de 50 ms -> 350 ms
+    next_block_edge = block50         # siguiente instante donde se actualiza F
+
+    # ============ Parámetros RR y refractario ============
+    rr_buffer = []                    # últimos RR (segundos)
+    refractory = int(0.2 * fs)        # 200 ms
+    last_qrs = None
+    M_at_200 = None                   # valor de M en 200 ms tras QRS
+
+    rpeaks_idx = []
+
+    # ======================================================
+    #  Bucle de detección muestra a muestra
+    # ======================================================
+    for i in range(init_samps, N):
+
+        # ---- Actualizar F(t) cada 50 ms (bloques de 50 ms) ----
+        if i >= next_block_edge:
+            block_start = max(0, i - block50 + 1)
+            block_max = float(np.max(Y[block_start:i + 1]))
+            F_block_max.append(block_max)
+
+            # Solo actualizamos F cuando ya tenemos los 7 bloques (350 ms)
+            if len(F_block_max) == 7:
+                earliest = F_block_max[0]
+                latest = F_block_max[-1]
+                F += (latest - earliest) / 150.0  # Christov: peso 1/150
+                if F < 0:
+                    F = 0.0
+
+            next_block_edge += block50
+
+        # ---- Distancia al último QRS (para M y R) ----
+        if last_qrs is None:
+            dt_samp = None
+            in_refrac = False
+        else:
+            dt_samp = i - last_qrs
+            in_refrac = dt_samp <= refractory
+
+        # ----------------- M(t): steep-slope -----------------
+        if last_qrs is None:
+            M_eff = M_static
+        else:
+            dt_sec = dt_samp / fs
+            if dt_sec <= 0.2:
+                # 0–200 ms: M se mantiene constante
+                M_eff = M_static
+            elif dt_sec <= 1.2:
+                # 200–1200 ms: M decrece linealmente hasta 60 % de su valor
+                if M_at_200 is None:
+                    M_at_200 = M_static
+                frac = (dt_sec - 0.2) / 1.0  # 0 -> 1 entre 0.2 y 1.2 s
+                M_eff = M_at_200 * (1.0 - 0.4 * frac)
+            else:
+                # >1200 ms: M se mantiene al 60 % del valor a 200 ms
+                if M_at_200 is None:
+                    M_at_200 = M_static
+                M_eff = 0.6 * M_at_200
+
+        # ----------------- R(t): beat expectation -------------
+        if last_qrs is None or len(rr_buffer) == 0:
+            R_eff = 0.0
+        else:
+            Rm = float(np.mean(rr_buffer))  # RR medio (s)
+            dt_sec = dt_samp / fs
+            if dt_sec <= (2.0 / 3.0) * Rm:
+                R_eff = 0.0
+            elif dt_sec <= Rm:
+                # fase donde se reduce el umbral para detectar QRS pequeños
+                alpha = (dt_sec - (2.0 / 3.0) * Rm) / (Rm / 3.0)
+                R_eff = -0.3 * M_eff * alpha  # ~ -0.2 mV en el paper
+            else:
+                R_eff = 0.0
+
+        # ----------------- Umbral combinado MFR ---------------
+        MFR = M_eff + F + R_eff
+
+        # ----------------- Condición de detección -------------
+        if (not in_refrac) and (Y[i] >= MFR):
+            rpeaks_idx.append(i)
+
+            # actualizar buffer de RR
+            if last_qrs is not None:
+                rr_sec = (i - last_qrs) / fs
+                rr_buffer.append(rr_sec)
+                if len(rr_buffer) > 5:
+                    rr_buffer.pop(0)
+
+            # actualizar M con el nuevo QRS
+            win_end = min(N, i + refractory)
+            Y_win = Y[i:win_end]
+            if len(Y_win) > 0:
+                newM5 = 0.6 * np.max(Y_win)
+            else:
+                newM5 = M_static
+
+            # limitar newM5 (si se dispara por artefactos)
+            M5_old = MM[-1]
+            if newM5 > 1.5 * M5_old:
+                newM5 = 1.1 * M5_old
+
+            MM = MM[1:] + [newM5]
+            M_static = float(np.mean(MM))
+
+            last_qrs = i
+            M_at_200 = None  # se recalculará en el próximo ciclo
+
+    rpeaks_idx = np.array(rpeaks_idx, dtype=int)
+    rpeaks_sec = rpeaks_idx / fs
+    return rpeaks_idx, rpeaks_sec
+
+# ============================================================
+#  QRS PEAK CORRECTION ALGORITHM (Christov/Niazy-style)
+# ============================================================
+
+def peaks_to_P(peaks, n_samples):
+    """Convierte índices de picos en vector binario P(n)."""
+    P = np.zeros(n_samples, dtype=int)
+    P[peaks] = 1
+    return P
+
+def P_to_peaks(P):
+    """Convierte P(n) binario de vuelta a índices de picos."""
+    return np.where(P == 1)[0]
+
+def get_sections(n_samples, fs, win_sec=20.0, overlap_sec=5.0):
+    """Devuelve lista de (start, end) para ventanas de 20 s solapadas 5 s."""
+    win = int(win_sec * fs)
+    step = int((win_sec - overlap_sec) * fs)  # 20 - 5 = 15 s
+    if step <= 0:
+        step = win
+    sections = []
+    start = 0
+    while start < n_samples:
+        end = min(n_samples, start + win)
+        sections.append((start, end))
+        if end == n_samples:
+            break
+        start += step
+    return sections
+
+def correct_false_positives(P, fs):
+    """
+    Falsos positivos:
+      - se calcula mediana y sd global de RR
+      - en cada sección de 20 s: si RR < (medianaRR - 3*sdRR)
+        se elimina el segundo pico de ese par.
+    """
+    peaks = P_to_peaks(P)
+    if len(peaks) < 2:
+        return P
+
+    rr_samples = np.diff(peaks)
+    rr_sec = rr_samples / fs
+    med_rr = np.median(rr_sec)
+    std_rr = np.std(rr_sec)
+    if std_rr == 0:
+        return P
+
+    sections = get_sections(len(P), fs)
+    for start, end in sections:
+        local_peaks = [p for p in peaks if start <= p < end]
+        if len(local_peaks) < 2:
+            continue
+        for i in range(len(local_peaks) - 1):
+            p1, p2 = local_peaks[i], local_peaks[i + 1]
+            rr = (p2 - p1) / fs
+            if rr < (med_rr - 3 * std_rr):
+                P[p2] = 0  # quitamos segundo pico (falso positivo)
+        peaks = P_to_peaks(P)
+    return P
+
+def compute_average_beat(ecg, peaks, fs, win_ms=400):
+    """
+    Construye plantilla del latido medio centrada en cada pico.
+    win_ms = duración total de la ventana (por ejemplo 400 ms).
+    """
+    half_win = int((win_ms / 1000.0) * fs / 2)
+    segments = []
+    for p in peaks:
+        start = p - half_win
+        end = p + half_win
+        if start < 0 or end > len(ecg):
+            continue
+        segments.append(ecg[start:end])
+    if not segments:
+        return None
+    segments = np.stack(segments)
+    return segments.mean(axis=0)
+
+def adjust_peaks_correlation(ecg, P, fs, win_ms=400, max_shift_ms=40):
+    """
+    Ajusta la posición de cada pico para maximizar la correlación
+    con el latido medio.
+    """
+    peaks = P_to_peaks(P)
+    template = compute_average_beat(ecg, peaks, fs, win_ms=win_ms)
+    if template is None:
+        return P
+
+    half_len = len(template) // 2
+    max_shift = int(max_shift_ms / 1000.0 * fs)
+    N = len(ecg)
+
+    newP = np.zeros_like(P)
+    for p in peaks:
+        best_p = p
+        best_corr = -1e9
+        for shift in range(-max_shift, max_shift + 1):
+            idx = p + shift
+            start = idx - half_len
+            end = idx + half_len
+            if start < 0 or end > N:
+                continue
+            seg = ecg[start:end]
+            num = float(np.dot(seg, template))
+            den = float(np.linalg.norm(seg) * np.linalg.norm(template))
+            if den == 0:
+                continue
+            corr = num / den
+            if corr > best_corr:
+                best_corr = corr
+                best_p = idx
+        newP[best_p] = 1
+    return newP
+
+def correct_false_negatives(P, fs):
+    """
+    Falsos negativos:
+      - P se divide en secciones de 20 s
+      - en cada sección se calcula medianaRR_u
+      - si RR > 1.5*medianaRR_u → se añade un pico en:
+            pico_anterior + medianaRR_u
+    """
+    n = len(P)
+    sections = get_sections(n, fs)
+    for start, end in sections:
+        peaks = [p for p in P_to_peaks(P) if start <= p < end]
+        if len(peaks) < 2:
+            continue
+        rr_samples = np.diff(peaks)
+        rr_sec = rr_samples / fs
+        med_rr = np.median(rr_sec)
+        med_rr_samples = int(med_rr * fs)
+        for i, rr in enumerate(rr_sec):
+            if rr > 1.5 * med_rr:
+                new_idx = peaks[i] + med_rr_samples
+                if new_idx < end and new_idx < n:
+                    P[new_idx] = 1
+    return P
+
+def qrs_correction_algorithm(raw, initial_peaks_idx, ecg_ch="ECG"):
+    """
+    Implementa el bloque completo de corrección:
+
+      1) P(n) binario desde los peaks iniciales.
+      2) Corrección de falsos positivos con RR < medianaRR - 3*sdRR.
+      3) Ajuste fino de posiciones por correlación con el latido medio.
+      4) Corrección de falsos negativos (RR > 1.5*medianaRR_u) añadiendo picos.
+      5) Segundo ajuste fino por correlación.
+
+    Devuelve:
+      peaks_idx_corr, peaks_sec_corr
+    """
+    fs = raw.info["sfreq"]
+    ecg = raw.copy().pick_channels([ecg_ch]).get_data()[0]
+    N = len(ecg)
+
+    # 1) P binario
+    P = peaks_to_P(initial_peaks_idx, N)
+
+    # 2) eliminar falsos positivos
+    P = correct_false_positives(P, fs)
+
+    # 3) ajustar por correlación
+    P = adjust_peaks_correlation(ecg, P, fs)
+
+    # 4) añadir falsos negativos
+    P = correct_false_negatives(P, fs)
+
+    # 5) segundo ajuste por correlación
+    P = adjust_peaks_correlation(ecg, P, fs)
+
+    peaks_idx_corr = P_to_peaks(P)
+    peaks_sec_corr = peaks_idx_corr / fs
+    return peaks_idx_corr, peaks_sec_corr
+
+# ============================================================
+#  PASO A FINAL: DETECCIÓN + CORRECCIÓN Y GUARDADO TSV (ECG 1 kHz)
+# ============================================================
+
+def step_A_detect_rpeaks_all_subjects():
+    """
+    Para cada sujeto y run (ficheros ECG .fif a 5000 Hz):
+      1) Carga el fichero noStimart_sr5000Hz_ecg_task-median_run-XX.fif.
+      2) Extrae el canal ECG (ECG_CHANNEL_NAME).
+      3) Detecta R-peaks con Teager+MFR (Christov) + corrección FP/FN.
+      4) Guarda un TSV con los picos CORREGIDOS:
+           - onset_sec: tiempo en segundos (en ECG 5 kHz)
+           - sample_5k: índice de muestra en ECG 5 kHz
+      5) (Opcional) Guarda un fichero .fif con el ECG 5 kHz + anotaciones de R-peaks.
+    """
+    for s in SUBJECTS:
+        subject_id = f"sub-{s:03d}"
+        print(f"\n================ PASO A: R-PEAKS (ECG 5 kHz): {subject_id} ================")
+
+        fif_files = find_ecg_5000_nostim_runs(s)
+        if not fif_files:
+            print("  ⚠ No se encontraron ficheros ECG 5 kHz para este sujeto.")
+            continue
+
+        for fif_file in fif_files:
+            print(f"\n  Cargando fichero ECG 5 kHz: {fif_file.name}")
+
+            try:
+                raw = mne.io.read_raw_fif(fif_file, preload=True, verbose="warning")
+            except Exception as e:
+                print(f"   ⚠ Error al cargar {fif_file.name}: {e}, salto este run.")
+                continue
+
+            if ECG_CHANNEL_NAME not in raw.ch_names:
+                print(f"   ⚠ Canal ECG '{ECG_CHANNEL_NAME}' no encontrado, salto este run.")
+                continue
+
+            # 1) detección inicial Teager+MFR en ECG 5 kHz
+            rpeaks_idx_raw, _ = detect_rpeaks_christov_MFR(
+                raw,
+                ecg_ch=ECG_CHANNEL_NAME
+            )
+
+            # 2) corrección completa FP/FN + correlación
+            rpeaks_idx, rpeaks_sec = qrs_correction_algorithm(
+                raw,
+                rpeaks_idx_raw,
+                ecg_ch=ECG_CHANNEL_NAME
+            )
+
+            print(f"   → Picos iniciales: {len(rpeaks_idx_raw)}, tras corrección: {len(rpeaks_idx)}")
+
+            # === Guardar ECG 5 kHz con R-peaks anotados para inspección ===
+            ann = mne.Annotations(
+                onset=rpeaks_sec,
+                duration=np.zeros_like(rpeaks_sec),
+                description=["RPEAK"] * len(rpeaks_sec)
+            )
+
+            if raw.annotations is not None and len(raw.annotations) > 0:
+                raw.set_annotations(raw.annotations + ann)
+            else:
+                raw.set_annotations(ann)
+
+            # run-id a partir del nombre del fichero
+            m_run = re.search(r"run-(\d+)", fif_file.name)
+            run_id = int(m_run.group(1)) if m_run else 1
+
+            # carpeta de salida para ECG 5 kHz anotado
+            ecg_out_subdir = ECG1K_RPEAKS_DIR / subject_id  # si la renombraste a ECG5K_RPEAKS_DIR, cambia aquí
+            ecg_out_subdir.mkdir(exist_ok=True, parents=True)
+
+            ecg_out_name = fif_file.name.replace(".fif", "_ecg5k_rpeaks.fif")
+            ecg_out_path = ecg_out_subdir / ecg_out_name
+
+            raw_ecg_only = raw.copy().pick_channels([ECG_CHANNEL_NAME])
+            raw_ecg_only.set_annotations(ann)
+            raw_ecg_only.save(ecg_out_path, overwrite=True)
+            print(f"   ✔ ECG 5 kHz con R-peaks guardado en: {ecg_out_path}")
+
+            # 3) Guardar TSV con R-peaks (onset_sec + sample_5k)
+            out_tsv = rpeaks_tsv_path(s, run_id)
+
+            df = pd.DataFrame({
+                "onset_sec": rpeaks_sec,      # tiempo en segundos (5 kHz)
+                "sample_5k": rpeaks_idx,      # índice de muestra a 5 kHz
+                "event": ["RPEAK"] * len(rpeaks_sec)
+            })
+            df.to_csv(out_tsv, sep="\t", index=False)
+            print(f"   ✔ TSV de R-peaks guardado: {out_tsv}")
+
+            del raw, raw_ecg_only
+
+    print("\nFIN Paso A: R-peaks corregidos (ECG 5 kHz) guardados para todos los sujetos.")
+
+# ============================================================
+#  PASO B: OBS (PCA temporal) PARA QUITAR ARTEFACTO CARDÍACO EN ESG
+# ============================================================
+
+def step_B_obs_correction_all_subjects():
+    """
+    Aplica OBS (PCA-OBS de MNE) a los canales ESG disponibles en cada fichero
+    de 1000 Hz sin artefacto de estimulación.
+
+    - Usa los tiempos de R-peaks (onset_sec) detectados en el Paso A.
+    - Filtrado automático de canales ESG existentes → evita errores.
+    """
+    for s in SUBJECTS:
+        subject_id = f"sub-{s:03d}"
+        print(f"\n================ PASO B: OBS ESG (MNE): {subject_id} ================")
+
+        esg_files = find_eeg_esg_1000_nostim_runs(s)
+        if not esg_files:
+            print("  ⚠ No se encontraron ficheros sr1000 sin artifact de estimulación.")
+            continue
+
+        for esg_fif in esg_files:
+            print(f"\n  Cargando ESG+EEG: {esg_fif.name}")
+            m_run = re.search(r"run-(\d+)", esg_fif.name)
+            run_id = int(m_run.group(1)) if m_run else 1
+
+            # cargar R-peaks (tiempos en segundos sobre ECG 1 kHz)
+            onsets_sec = load_rpeaks_for_run(s, run_id)
+            if onsets_sec.size == 0:
+                print("   ⚠ Sin R-peaks para este run, se omite corrección.")
+                continue
+
+            # cargar datos a 1 kHz
+            raw_esg = mne.io.read_raw_fif(esg_fif, preload=True, verbose="warning")
+            print(f"   sfreq ESG/EEG = {raw_esg.info['sfreq']} Hz")
+
+            # canales ESG que realmente existen en este fichero
+            existing_channels = [ch for ch in ESG_CHANNELS if ch in raw_esg.ch_names]
+
+            if not existing_channels:
+                print("   ⚠ Ningún canal de ESG_CHANNELS existe en este fichero. Se omite.")
+                continue
+
+            print(f"   → Canales que SI existen y se limpiarán: {existing_channels}")
+            picks = mne.pick_channels(raw_esg.ch_names, include=existing_channels)
+
+            # OBS oficial de MNE (PCA sobre latidos alrededor de qrs_times)
+            raw_clean = apply_pca_obs(
+                raw_esg,
+                qrs_times=onsets_sec,  # tiempos en segundos (no índices)
+                picks=picks,
+                n_components=4         # igual que en Nierula et al.
+            )
+
+            # guardar resultado (mismos canales, ESG limpios)
+            out_subdir = ESG_ECGCLEAN_DIR / subject_id
+            out_subdir.mkdir(exist_ok=True, parents=True)
+            out_name = esg_fif.name.replace(".fif", "_ecgclean.fif")
+            out_path = out_subdir / out_name
+            raw_clean.save(out_path, overwrite=True)
+            print(f"   ✔ ESG corregido guardado en: {out_path}")
+
+            del raw_esg, raw_clean
+
+    print("\nFIN Paso B: OBS aplicado (versión oficial MNE).")
+
+# ============================================================
+#  EJECUCIÓN (DESCOMENTA LO QUE QUIERAS CORRER)
+# ============================================================
+
+if __name__ == "__main__":
+    # Paso A: detectar R-peaks en ECG 1 kHz y guardar TSV + ECG anotado
+    step_A_detect_rpeaks_all_subjects()
+
+    # Paso B: aplicar OBS (PCA-OBS) a los canales ESG usando los R-peaks
+    step_B_obs_correction_all_subjects()
