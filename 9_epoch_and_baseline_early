@@ -1,4 +1,10 @@
-# 9_epoch_and_baseline_early.py
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  3 15:21:52 2025
+
+@author: navar
+"""
+
 """
 Paso 9: epocaje para potenciales tempranos (SEPs):
 
@@ -39,8 +45,12 @@ def pick_stim_events(raw):
         # si no hay match, usamos todos
         selected_ids = list(event_id.values())
 
-    mask = mne.pick_events(events, include=selected_ids)
-    return events[mask], {k: v for k, v in event_id.items() if v in selected_ids}
+    # ⚠ OJO: mne.pick_events ya devuelve los eventos filtrados
+    selected_events = mne.pick_events(events, include=selected_ids)
+
+    selected_event_id = {k: v for k, v in event_id.items() if v in selected_ids}
+
+    return selected_events, selected_event_id
 
 
 def step9_epoch_early(subjects=range(1, 10)):
@@ -81,4 +91,4 @@ def step9_epoch_early(subjects=range(1, 10)):
 
 
 if __name__ == "__main__":
-    step9_epoch_early(range(1, 10))
+    step9_epoch_early(range(1, 3))
