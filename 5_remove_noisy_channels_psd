@@ -1,22 +1,32 @@
-
 """
 Paso 5: tras PCA-OBS, inspección visual de canales ruidosos
 mediante densidad espectral (PSD) por canal ESG.
 
+Ahora: seleccionar canales malos haciendo clic en las curvas del PSD.
+
 Uso:
   - Ejecuta este script.
-  - Para cada sujeto/run, miras la PSD y apuntas los canales malos.
-  - Escribes esos canales en un CSV manual (ver formato al final).
+  - Para cada sujeto/run, se abrirá una figura con la PSD.
+  - Haz clic sobre las curvas de los canales que consideres malos
+    (el canal clicado cambia de aspecto).
+  - Cierra la ventana cuando hayas acabado con ese run.
+  - Al final se genera un CSV con los canales malos seleccionados.
 """
 
 from pathlib import Path
 import re
+import csv
+
+import matplotlib.pyplot as plt
 import mne
 
 BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 
 ESG_ECGCLEAN_DIR = BASE / "esg_1000Hz_ecgclean_obs"
 TASK_NAME = "median"
+
+# Salida automática de canales malos
+OUTPUT_CSV = BASE / "bad_esg_channels_from_psd_clicks.csv"
 
 # Ajusta según tus canales ESG reales
 ESG_CHANNELS = [
@@ -29,10 +39,86 @@ ESG_CHANNELS = [
 def find_esg_clean_runs(subject: int):
     subj = f"sub-{subject:03d}"
     subj_dir = ESG_ECGCLEAN_DIR / subj
-    return sorted(subj_dir.glob(f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*_ecgclean.fif"))
+    return sorted(
+        subj_dir.glob(
+            f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*_ecgclean.fif"
+        )
+    )
+
+def interactive_psd_bad_selection(raw, picks, fmin=0.5, fmax=500.0):
+    """
+    Muestra un PSD interactivo. Al hacer clic en una curva de canal,
+    se alterna su estado "malo". Devuelve la lista de canales malos
+    tras cerrar la ventana.
+    """
+    # Desactivar modo interactivo para que show bloquee
+    plt.ioff()
+
+    psd = raw.compute_psd(
+        picks=picks,
+        fmin=fmin,
+        fmax=fmax,
+        method="welch",
+        n_fft=2048,
+    )
+    psds, freqs = psd.get_data(return_freqs=True)
+
+    fig, ax = plt.subplots()
+    ax.set_title("PSD ESG (clic para marcar canales malos)")
+    ax.set_xlabel("Frecuencia (Hz)")
+    ax.set_ylabel("Potencia (uV^2/Hz)")
+    ax.set_xscale("log")
+    ax.set_xlim((fmin, fmax))
+
+    lines = []
+    bad_channels = set()
+
+    for ch_idx, ch_name in enumerate(psd.ch_names):
+        line, = ax.plot(
+            freqs,
+            psds[ch_idx],
+            label=ch_name,
+            picker=True,
+            pickradius=5,
+        )
+        lines.append(line)
+
+    ax.legend(loc="best", fontsize="small")
+
+    def toggle_bad(line):
+        ch_name = line.get_label()
+        if ch_name in bad_channels:
+            bad_channels.remove(ch_name)
+            line.set_linewidth(1.0)
+            line.set_alpha(1.0)
+        else:
+            bad_channels.add(ch_name)
+            line.set_linewidth(3.0)
+            line.set_alpha(0.3)
+
+    def on_pick(event):
+        this_line = event.artist
+        toggle_bad(this_line)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("pick_event", on_pick)
+
+    print("   → Clic en las curvas para marcar canales malos.")
+    print("     Cierra la ventana cuando termines con este run.")
+
+    # 👇 Esto es lo importante: bloquear hasta cerrar la ventana
+    plt.show(block=True)
+
+    # Por si acaso, cerrar explícitamente la figura
+    plt.close(fig)
+
+    return sorted(bad_channels)
+
 
 
 def step5_plot_psd(subjects=range(1, 10)):
+    all_rows = []  # acumularemos (subject, run, bad_channels_string)
+
     for s in subjects:
         subj_id = f"sub-{s:03d}"
         fif_files = find_esg_clean_runs(s)
@@ -53,22 +139,31 @@ def step5_plot_psd(subjects=range(1, 10)):
 
             raw.pick(esg_ch)
 
-            # PSD interactivo
-            print("   → Mostrando PSD para inspección visual (cerrar ventana para continuar)...")
-            raw.plot_psd(fmin=0.5, fmax=500.0, average=False)
+            # PSD interactivo con selección de canales malos
+            print("   → Mostrando PSD para inspección visual...")
+            bad_ch = interactive_psd_bad_selection(raw, esg_ch)
+
+            # Detectar run a partir del nombre del archivo
+            m = re.search(r"run-(\d+)", fif.name)
+            run_num = int(m.group(1)) if m else -1
+
+            bad_str = ";".join(bad_ch)
+            print(f"   → Canales malos seleccionados para {subj_id}, run {run_num}: {bad_str}")
+
+            all_rows.append((subj_id, run_num, bad_str))
+
+    # Guardar resultados en CSV
+    if all_rows:
+        print(f"\nEscribiendo CSV con canales malos en: {OUTPUT_CSV}")
+        with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["subject", "run", "bad_channels"])
+            for subj_id, run_num, bad_str in all_rows:
+                writer.writerow([subj_id, run_num, bad_str])
+        print("Hecho.")
+    else:
+        print("\nNo se han generado filas de canales malos; no se crea CSV.")
 
 
 if __name__ == "__main__":
-    step5_plot_psd(range(1, 10))
-
-"""
-Después de inspeccionar las PSDs, crea un CSV manual (por ejemplo
-BASE / 'bad_esg_channels_manual.csv') con columnas:
-
-subject,run,bad_channels
-sub-001,3,"S6;SC6"
-sub-001,5,"S3"
-sub-002,3,""
-
-Este CSV será leído en el Paso 6.
-"""
+    step5_plot_psd(range(1,3))
