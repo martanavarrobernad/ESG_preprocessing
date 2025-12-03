@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  3 15:21:13 2025
+
+@author: navar
+"""
+
 # 8_continuous_100uV_rejection.py
 """
 Paso 8: en datos continuos filtrados (tempranos):
@@ -20,6 +27,12 @@ BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 IN_DIR  = BASE / "esg_step7_filtered_early"
 OUT_DIR = BASE / "esg_step8_clean_early"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+ESG_CERV = [ 
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6",
+]
 
 # UMBRAL
 THRESH_V = 100e-6  # 100 µV
@@ -102,7 +115,9 @@ def step8_clean_early(subjects=range(1, 10)):
             raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
 
             # ESG = todos los canales no marcados como ECG/EOG/etc. (o usa tu lista)
-            esg_idx = mne.pick_types(raw.info, eeg=False, meg=False, misc=True, ecg=False, eog=False, stim=False)
+            esg_ch_present = [ch for ch in ESG_CERV if ch in raw.ch_names]
+            esg_idx = mne.pick_channels(raw.ch_names, include=esg_ch_present)
+
             if not len(esg_idx):
                 print("   ⚠ No ESG picks found, saltando.")
                 continue
