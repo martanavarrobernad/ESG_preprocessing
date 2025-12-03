@@ -1,0 +1,71 @@
+# 7_filter_early_SEPs.py
+"""
+Paso 7: filtrar señales (tempranas) con:
+  - notch 48–53 Hz (approx. usando notch 50 Hz ancho 5 Hz)
+  - band-pass 30–400 Hz (Butterworth 4th order, zero-phase)
+
+Entrada:
+  - esg_step6_concat_ref/sub-XXX/<cond>_ref-XXX_concat.fif
+
+Salida:
+  - esg_step7_filtered_early/sub-XXX/<cond>_ref-XXX_early_filt.fif
+"""
+
+from pathlib import Path
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "esg_step6_concat_ref"
+OUT_DIR = BASE / "esg_step7_filtered_early"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+CONDITIONS = ["median"]  # o ["hand-mixed", "foot-mixed"] etc.
+
+
+def step7_filter_early(subjects=range(1, 10)):
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        subj_dir = IN_DIR / subj_id
+        if not subj_dir.exists():
+            continue
+
+        fif_files = sorted(subj_dir.glob("*_ref-*_concat.fif"))
+        if not fif_files:
+            continue
+
+        print(f"\n===== {subj_id} =====")
+        for fif in fif_files:
+            print(f"  Cargando {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+
+            # NOTCH 48–53 Hz ~ notch 50 Hz ancho 5 Hz
+            print("   → Notch 48–53 Hz (approx, notch 50 Hz, width 5 Hz)...")
+            raw.notch_filter(
+                freqs=[50.0],
+                notch_widths=5.0,
+                method="iir",
+                iir_params=dict(order=4, ftype="butter"),
+                phase="zero",
+                verbose="error",
+            )
+
+            # BAND-PASS 30–400 Hz
+            print("   → Band-pass 30–400 Hz (Butterworth 4th, zero-phase)...")
+            raw.filter(
+                l_freq=30.0,
+                h_freq=400.0,
+                method="iir",
+                iir_params=dict(order=4, ftype="butter"),
+                phase="zero",
+                verbose="error",
+            )
+
+            out_subdir = OUT_DIR / subj_id
+            out_subdir.mkdir(exist_ok=True, parents=True)
+            out_fif = out_subdir / fif.name.replace("_concat.fif", "_early_filt.fif")
+            raw.save(out_fif, overwrite=True)
+            print(f"   ✔ Guardado filtrado temprano: {out_fif}")
+
+
+if __name__ == "__main__":
+    step7_filter_early(range(1, 10))
