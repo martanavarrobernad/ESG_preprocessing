@@ -1,4 +1,4 @@
-# 6_concat_and_reference.py
+
 """
 Paso 6: concatenar runs por condición y crear referencias TH6 / ventral.
 
@@ -7,11 +7,21 @@ Entrada:
 
 Salida:
   - esg_step6_concat_ref/sub-XXX/<cond>_ref-TH6_concat.fif
+      (los datos ESG tal y como fueron grabados: ya referenciados a TH6)
   - esg_step6_concat_ref/sub-XXX/<cond>_ref-VENTRAL_concat.fif
+      (misma señal ESG, re-referenciada algebraicamente a AC o AL)
+
+Importante:
+  - En el dataset original, TH6 es el electrodo de referencia de hardware
+    (no aparece como canal en raw.ch_names). Por tanto:
+      * NO se puede restar "TH6" como canal.
+      * El fichero ref-TH6 es simplemente el ESG limpio/concatenado.
 
 Requiere:
-  - CSV manual con canales malos (salida conceptual del paso 5):
+  - CSV con canales malos (salida del paso 5):
     BASE / 'bad_esg_channels_manual.csv'
+    con columnas: subject,run,bad_channels
+    donde bad_channels es una lista separada por ';'
 """
 
 from pathlib import Path
@@ -21,26 +31,31 @@ import pandas as pd
 import mne
 
 BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+# ESG ecg-clean (salida del paso 4 / 5)
 ESG_ECGCLEAN_DIR = BASE / "esg_1000Hz_ecgclean_obs"
+
+# Carpeta de salida para este paso
 OUT_DIR = BASE / "esg_step6_concat_ref"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
-TASK_NAME = "median"  # o la condición que estés procesando
+TASK_NAME = "median"  # condición a procesar
 
-# canal de referencia dorsal (grabación, TH6)
-TH6_CH = "TH6"
+# Etiqueta descriptiva de la referencia dorsal (no es un canal)
+TH6_LABEL = "TH6"
 
-# referencia ventral según condición (ajusta nombres según tu BIDS)
+# referencia ventral según condición
 VENTRAL_REF_BY_COND = {
     "hand-mixed": "AC",
     "foot-mixed": "AL",
-    # si tu "median" corresponde a mano, puedes mapearlo así:
+    # en tus datos, "median" es mano → AC
     "median": "AC",
 }
 
-BAD_CSV = BASE / "bad_esg_channels_manual.csv"
+# CSV con canales malos (puedes cambiar el nombre si usaste otro)
+BAD_CSV = BASE / "bad_esg_channels_from_psd_clicks.csv"
 
-# canales ESG (los que quieres conservar)
+# canales ESG (dorsales) que quieres conservar
 ESG_CHANNELS = [
     "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
     "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
@@ -48,13 +63,17 @@ ESG_CHANNELS = [
 ]
 
 
+# ---------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------
 def load_bad_channels():
     """
-    Lee CSV manual con columnas: subject,run,bad_channels
+    Lee CSV con columnas: subject,run,bad_channels
     donde bad_channels es una lista separada por ';'
+    Devuelve: dict[(subject, run)] -> [lista de canales malos]
     """
     if not BAD_CSV.exists():
-        print("⚠ No existe bad_esg_channels_manual.csv → no se eliminarán canales.")
+        print(f"⚠ No existe {BAD_CSV.name} → no se eliminarán canales.")
         return {}
 
     df = pd.read_csv(BAD_CSV)
@@ -66,17 +85,32 @@ def load_bad_channels():
         else:
             chans = []
         bad_dict[key] = chans
+    print(f"   ✓ Cargado CSV de canales malos: {BAD_CSV.name}")
     return bad_dict
 
 
 def find_esg_clean_runs(subject: int):
+    """Devuelve lista de FIF ESG ecg-clean para un sujeto."""
     subj = f"sub-{subject:03d}"
     subj_dir = ESG_ECGCLEAN_DIR / subj
-    return sorted(subj_dir.glob(f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*_ecgclean.fif"))
+    return sorted(
+        subj_dir.glob(
+            f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*_ecgclean.fif"
+        )
+    )
 
 
 def reref_esg(raw, esg_chs, ref_ch):
-    """Resta el canal ref_ch a todos los esg_chs (re-referencia algebraica simple)."""
+    """
+    Re-referencia algebraicamente todos los canales esg_chs
+    restando el canal ref_ch.
+
+    raw: Raw MNE
+    esg_chs: lista de nombres de canal ESG (sin incluir ref_ch)
+    ref_ch: nombre de canal a usar como referencia (AC, AL, etc.)
+
+    Devuelve: Raw nuevo, con misma estructura, pero datos ESG re-referenciados.
+    """
     if ref_ch not in raw.ch_names:
         raise RuntimeError(f"Referencia {ref_ch} no está en raw.ch_names")
 
@@ -91,6 +125,9 @@ def reref_esg(raw, esg_chs, ref_ch):
     return raw_ref
 
 
+# ---------------------------------------------------------------------
+# Paso 6 principal
+# ---------------------------------------------------------------------
 def step6_concat_and_reference(subjects=range(1, 10), condition_label="median"):
     bad_dict = load_bad_channels()
 
@@ -101,9 +138,10 @@ def step6_concat_and_reference(subjects=range(1, 10), condition_label="median"):
             print(f"{subject_id}: sin ESG ecgclean para {TASK_NAME}, salto.")
             continue
 
-        print(f"\n===== {subject_id} =====")
+        print(f"\n===== {subject_id} ({condition_label}) =====")
         raws = []
         runs = []
+
         for fif in fif_files:
             m = re.search(r"run-(\d+)", fif.name)
             run = int(m.group(1)) if m else 1
@@ -112,66 +150,72 @@ def step6_concat_and_reference(subjects=range(1, 10), condition_label="median"):
             print(f"  Cargando {fif.name}")
             raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
 
-            # Seleccionar sólo ESG + TH6 + ventral ref
+            # ESG presentes
             esg_ch_present = [ch for ch in ESG_CHANNELS if ch in raw.ch_names]
-            keep_extra = [TH6_CH] if TH6_CH in raw.ch_names else []
+
+            # Referencia ventral (AC / AL) si existe
             ref_ventral = VENTRAL_REF_BY_COND.get(condition_label, None)
+            keep_extra = []
             if ref_ventral and ref_ventral in raw.ch_names:
                 keep_extra.append(ref_ventral)
 
+            # Seleccionar sólo ESG + ventral (si está)
             picks = mne.pick_channels(
                 raw.ch_names,
-                include=list(set(esg_ch_present + keep_extra))
+                include=sorted(set(esg_ch_present + keep_extra)),
             )
             raw.pick(picks)
 
-            # Eliminar canales ruidosos (manual, paso 5)
+            # Eliminar canales ruidosos de este run según CSV
             key = (subject_id, run)
             bad = bad_dict.get(key, [])
             bad = [ch for ch in bad if ch in raw.ch_names]
             if bad:
-                print(f"   → Eliminando canales ruidosos (manual): {bad}")
+                print(f"   → Eliminando canales ruidosos (CSV): {bad}")
                 raw.drop_channels(bad)
 
             raws.append(raw)
 
         if not raws:
-            print("   ⚠ No hay datos concatenables.")
+            print("   ⚠ No hay datos concatenables (todo dropeado).")
             continue
 
+        # Concatenar runs
         raw_concat = mne.concatenate_raws(raws)
         print(f"   Concatenado: duración total = {raw_concat.times[-1]:.1f} s")
 
-        # ESG channels tras dropear
+        # Canales ESG finales tras dropear
         esg_ch_final = [ch for ch in ESG_CHANNELS if ch in raw_concat.ch_names]
         if not esg_ch_final:
-            print("   ⚠ No quedan canales ESG tras eliminar ruidosos.")
+            print("   ⚠ No quedan canales ESG tras eliminar ruidosos. Salto sujeto.")
             continue
 
-        # --- referencia TH6 ---
-        if TH6_CH in raw_concat.ch_names:
-            raw_th6 = reref_esg(raw_concat, esg_ch_final, TH6_CH)
-            out_subdir = OUT_DIR / subject_id
-            out_subdir.mkdir(exist_ok=True, parents=True)
-            out_th6 = out_subdir / f"{condition_label}_ref-TH6_concat.fif"
-            raw_th6.save(out_th6, overwrite=True)
-            print(f"   ✔ Guardado TH6-ref: {out_th6}")
-        else:
-            print(f"   ⚠ No se encontró {TH6_CH}, no se guarda ref-TH6.")
+        out_subdir = OUT_DIR / subject_id
+        out_subdir.mkdir(exist_ok=True, parents=True)
 
-        # --- referencia ventral ---
+        # ---------------- ref-TH6 (ya viene de hardware) ----------------
+        # Guardamos sólo los canales ESG dorsales, tal cual.
+        raw_th6 = raw_concat.copy().pick(esg_ch_final)
+        out_th6 = out_subdir / f"{condition_label}_ref-{TH6_LABEL}_concat.fif"
+        raw_th6.save(out_th6, overwrite=True)
+        print(f"   ✔ Guardado TH6-ref (sin re-referencia adicional): {out_th6}")
+
+        # ---------------- ref-VENTRAL (AC / AL) ----------------
         ref_ventral = VENTRAL_REF_BY_COND.get(condition_label, None)
         if ref_ventral and ref_ventral in raw_concat.ch_names:
+            print(f"   → Re-referenciando ESG a canal ventral {ref_ventral}...")
             raw_vent = reref_esg(raw_concat, esg_ch_final, ref_ventral)
-            out_subdir = OUT_DIR / subject_id
-            out_subdir.mkdir(exist_ok=True, parents=True)
+            # Nos quedamos sólo con ESG, ya en ref ventral
+            raw_vent = raw_vent.pick(esg_ch_final)
             out_vent = out_subdir / f"{condition_label}_ref-{ref_ventral}_concat.fif"
             raw_vent.save(out_vent, overwrite=True)
             print(f"   ✔ Guardado ventral-ref ({ref_ventral}): {out_vent}")
         else:
-            print(f"   ⚠ No ref ventral válida para {condition_label}.")
+            print(f"   ⚠ No se encontró canal ventral válido para {condition_label}.")
+            print(f"      (Buscado: {VENTRAL_REF_BY_COND.get(condition_label, None)})")
 
 
 if __name__ == "__main__":
-    # ajusta 'condition_label' si quieres usar hand-mixed / foot-mixed
-    step6_concat_and_reference(subjects=range(1, 10), condition_label="median")
+    # ajusta 'subjects' y 'condition_label' según tus datos
+    step6_concat_and_reference(subjects=range(1, 3), condition_label="median")
+
