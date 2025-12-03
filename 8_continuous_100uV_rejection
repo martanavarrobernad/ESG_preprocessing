@@ -1,0 +1,120 @@
+# 8_continuous_100uV_rejection.py
+"""
+Paso 8: en datos continuos filtrados (tempranos):
+  - marcar muestras donde |ESG| > 100 µV
+  - si un canal tiene >50% muestras >100 µV → canal excluido
+  - para el resto, se añaden anotaciones BAD_100uV en los tramos malos
+
+Entrada:
+  - esg_step7_filtered_early/sub-XXX/..._early_filt.fif
+
+Salida:
+  - esg_step8_clean_early/sub-XXX/..._early_clean.fif
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "esg_step7_filtered_early"
+OUT_DIR = BASE / "esg_step8_clean_early"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+# UMBRAL
+THRESH_V = 100e-6  # 100 µV
+
+
+def mark_bad_segments(raw, esg_idx, thresh=THRESH_V):
+    data = raw.get_data(picks=esg_idx)
+    n_ch, n_t = data.shape
+
+    bad_mask = np.abs(data) > thresh
+
+    # quitar canales con >50% muestras malas
+    keep_channels = []
+    bad_channels = []
+    for i, ch_idx in enumerate(esg_idx):
+        frac_bad = bad_mask[i].mean()
+        ch_name = raw.ch_names[ch_idx]
+        if frac_bad > 0.5:
+            bad_channels.append(ch_name)
+        else:
+            keep_channels.append(ch_idx)
+
+    if bad_channels:
+        print(f"   → Excluyendo canales con >50% muestras >100µV: {bad_channels}")
+        raw.info["bads"].extend(bad_channels)
+
+    # recomputar bad_mask sólo para canales kept
+    if keep_channels:
+        keep_mask = bad_mask[[esg_idx.tolist().index(k) for k in keep_channels]]
+        bad_any = keep_mask.any(axis=0)
+    else:
+        bad_any = np.zeros(n_t, dtype=bool)
+
+    # convertir bad_any en anotaciones continuas
+    onsets = []
+    durations = []
+    sfreq = raw.info["sfreq"]
+
+    in_bad = False
+    start_idx = 0
+    for i, is_bad in enumerate(bad_any):
+        if is_bad and not in_bad:
+            in_bad = True
+            start_idx = i
+        elif not is_bad and in_bad:
+            in_bad = False
+            end_idx = i
+            onsets.append(start_idx / sfreq)
+            durations.append((end_idx - start_idx) / sfreq)
+    if in_bad:
+        onsets.append(start_idx / sfreq)
+        durations.append((n_t - start_idx) / sfreq)
+
+    if onsets:
+        print(f"   → Añadiendo {len(onsets)} anotaciones BAD_100uV")
+        ann = mne.Annotations(
+            onset=onsets,
+            duration=durations,
+            description=["BAD_100uV"] * len(onsets),
+        )
+        raw.set_annotations(raw.annotations + ann)
+
+    return raw
+
+
+def step8_clean_early(subjects=range(1, 10)):
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        subj_dir = IN_DIR / subj_id
+        if not subj_dir.exists():
+            continue
+
+        fif_files = sorted(subj_dir.glob("*_early_filt.fif"))
+        if not fif_files:
+            continue
+
+        print(f"\n===== {subj_id} =====")
+        for fif in fif_files:
+            print(f"  Cargando {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+
+            # ESG = todos los canales no marcados como ECG/EOG/etc. (o usa tu lista)
+            esg_idx = mne.pick_types(raw.info, eeg=False, meg=False, misc=True, ecg=False, eog=False, stim=False)
+            if not len(esg_idx):
+                print("   ⚠ No ESG picks found, saltando.")
+                continue
+
+            raw = mark_bad_segments(raw, esg_idx)
+
+            out_subdir = OUT_DIR / subj_id
+            out_subdir.mkdir(exist_ok=True, parents=True)
+            out_fif = out_subdir / fif.name.replace("_early_filt.fif", "_early_clean.fif")
+            raw.save(out_fif, overwrite=True)
+            print(f"   ✔ Guardado limpio continuo: {out_fif}")
+
+
+if __name__ == "__main__":
+    step8_clean_early(range(1, 10))
