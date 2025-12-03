@@ -1,0 +1,177 @@
+# 10_preproc_late_potentials.py
+"""
+Paso 10: preprocesado para potenciales tardíos.
+
+Igual que pasos 7–9, pero:
+  - referencia: siempre TH6
+  - band-pass: 5–400 Hz (en vez de 30–400 Hz)
+
+Entrada:
+  - esg_step6_concat_ref/sub-XXX/<cond>_ref-TH6_concat.fif
+
+Salida:
+  - esg_late_step7_filt/sub-XXX/..._late_filt.fif
+  - esg_late_step8_clean/sub-XXX/..._late_clean.fif
+  - esg_late_step9_epochs/sub-XXX/..._late-epo.fif
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR6  = BASE / "esg_step6_concat_ref"
+
+OUT7 = BASE / "esg_late_step7_filt"
+OUT8 = BASE / "esg_late_step8_clean"
+OUT9 = BASE / "esg_late_step9_epochs"
+for d in (OUT7, OUT8, OUT9):
+    d.mkdir(exist_ok=True, parents=True)
+
+THRESH_V = 100e-6  # 100 µV
+STIM_KEYWORDS = ["median", "stim", "pulse"]
+
+
+def mark_bad_segments(raw, picks_esg, thresh=THRESH_V):
+    data = raw.get_data(picks=picks_esg)
+    n_ch, n_t = data.shape
+    bad_mask = np.abs(data) > thresh
+
+    keep_ch = []
+    bad_ch = []
+    for i, idx in enumerate(picks_esg):
+        frac_bad = bad_mask[i].mean()
+        ch_name = raw.ch_names[idx]
+        if frac_bad > 0.5:
+            bad_ch.append(ch_name)
+        else:
+            keep_ch.append(idx)
+
+    if bad_ch:
+        raw.info["bads"].extend(bad_ch)
+
+    if keep_ch:
+        keep_mask = bad_mask[[picks_esg.tolist().index(k) for k in keep_ch]]
+        bad_any = keep_mask.any(axis=0)
+    else:
+        bad_any = np.zeros(n_t, dtype=bool)
+
+    sfreq = raw.info["sfreq"]
+    onsets, durations = [], []
+    in_bad = False
+    start = 0
+    for i, b in enumerate(bad_any):
+        if b and not in_bad:
+            in_bad = True
+            start = i
+        elif not b and in_bad:
+            in_bad = False
+            onsets.append(start / sfreq)
+            durations.append((i - start) / sfreq)
+    if in_bad:
+        onsets.append(start / sfreq)
+        durations.append((n_t - start) / sfreq)
+
+    if onsets:
+        ann = mne.Annotations(onset=onsets, duration=durations,
+                              description=["BAD_100uV"] * len(onsets))
+        raw.set_annotations(raw.annotations + ann)
+
+    return raw
+
+
+def pick_stim_events(raw):
+    events, event_id = mne.events_from_annotations(raw, verbose="error")
+    if not event_id:
+        raise RuntimeError("No annotations → no stimulus events.")
+    sel_ids = []
+    for desc, code in event_id.items():
+        if any(k in desc.lower() for k in STIM_KEYWORDS):
+            sel_ids.append(code)
+    if not sel_ids:
+        sel_ids = list(event_id.values())
+    mask = mne.pick_events(events, include=sel_ids)
+    return events[mask], {k: v for k, v in event_id.items() if v in sel_ids}
+
+
+def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        subj_dir = IN_DIR6 / subj_id
+        if not subj_dir.exists():
+            continue
+
+        fif_path = subj_dir / f"{condition_label}_ref-TH6_concat.fif"
+        if not fif_path.exists():
+            print(f"{subj_id}: no TH6-ref concat para {condition_label}, salto.")
+            continue
+
+        print(f"\n===== {subj_id} ({condition_label}, late potentials) =====")
+        print(f"  Cargando {fif_path.name}")
+        raw = mne.io.read_raw_fif(fif_path, preload=True, verbose="warning")
+
+        # Paso 7 (late): notch + BPF 5–400
+        print("   → Notch 48–53 Hz (approx, notch 50 Hz width 5 Hz)...")
+        raw.notch_filter(
+            freqs=[50.0],
+            notch_widths=5.0,
+            method="iir",
+            iir_params=dict(order=4, ftype="butter"),
+            phase="zero",
+            verbose="error",
+        )
+
+        print("   → Band-pass 5–400 Hz (Butterworth 4th, zero-phase)...")
+        raw.filter(
+            l_freq=5.0,
+            h_freq=400.0,
+            method="iir",
+            iir_params=dict(order=4, ftype="butter"),
+            phase="zero",
+            verbose="error",
+        )
+
+        out7_subdir = OUT7 / subj_id
+        out7_subdir.mkdir(exist_ok=True, parents=True)
+        out7_fif = out7_subdir / f"{condition_label}_ref-TH6_late_filt.fif"
+        raw.save(out7_fif, overwrite=True)
+        print(f"   ✔ Guardado late filt: {out7_fif}")
+
+        # Paso 8 (late): 100 µV
+        print("   → Paso 8 (late) umbral 100 µV continuo...")
+        raw = mne.io.read_raw_fif(out7_fif, preload=True, verbose="warning")
+        picks_esg = mne.pick_types(raw.info, eeg=False, meg=False, misc=True, ecg=False, eog=False, stim=False)
+        raw = mark_bad_segments(raw, picks_esg)
+
+        out8_subdir = OUT8 / subj_id
+        out8_subdir.mkdir(exist_ok=True, parents=True)
+        out8_fif = out8_subdir / f"{condition_label}_ref-TH6_late_clean.fif"
+        raw.save(out8_fif, overwrite=True)
+        print(f"   ✔ Guardado late clean: {out8_fif}")
+
+        # Paso 9 (late): epocaje mismo rango que temprano salvo que quieras cambiarlo
+        print("   → Paso 9 (late) epocaje...")
+        raw = mne.io.read_raw_fif(out8_fif, preload=True, verbose="warning")
+        events, event_id = pick_stim_events(raw)
+
+        epochs = mne.Epochs(
+            raw,
+            events,
+            event_id=event_id,
+            tmin=-0.2,
+            tmax=0.7,
+            baseline=(-0.11, -0.01),
+            reject_by_annotation=True,
+            preload=True,
+            verbose="error",
+        )
+
+        out9_subdir = OUT9 / subj_id
+        out9_subdir.mkdir(exist_ok=True, parents=True)
+        out9_fif = out9_subdir / f"{condition_label}_ref-TH6_late-epo.fif"
+        epochs.save(out9_fif, overwrite=True)
+        print(f"   ✔ Guardado epochs late: {out9_fif}")
+
+
+if __name__ == "__main__":
+    run_late_pipeline(range(1, 10), condition_label="median")
