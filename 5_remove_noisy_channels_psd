@@ -1,0 +1,74 @@
+
+"""
+Paso 5: tras PCA-OBS, inspección visual de canales ruidosos
+mediante densidad espectral (PSD) por canal ESG.
+
+Uso:
+  - Ejecuta este script.
+  - Para cada sujeto/run, miras la PSD y apuntas los canales malos.
+  - Escribes esos canales en un CSV manual (ver formato al final).
+"""
+
+from pathlib import Path
+import re
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+ESG_ECGCLEAN_DIR = BASE / "esg_1000Hz_ecgclean_obs"
+TASK_NAME = "median"
+
+# Ajusta según tus canales ESG reales
+ESG_CHANNELS = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6",
+]
+
+
+def find_esg_clean_runs(subject: int):
+    subj = f"sub-{subject:03d}"
+    subj_dir = ESG_ECGCLEAN_DIR / subj
+    return sorted(subj_dir.glob(f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*_ecgclean.fif"))
+
+
+def step5_plot_psd(subjects=range(1, 10)):
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        fif_files = find_esg_clean_runs(s)
+        if not fif_files:
+            print(f"{subj_id}: no ESG ecg-clean files, skipping.")
+            continue
+
+        print(f"\n===== {subj_id} =====")
+        for fif in fif_files:
+            print(f"  Loading {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+
+            # Sólo canales ESG existentes
+            esg_ch = [ch for ch in ESG_CHANNELS if ch in raw.ch_names]
+            if not esg_ch:
+                print("   ⚠ No ESG channels from list in this file.")
+                continue
+
+            raw.pick(esg_ch)
+
+            # PSD interactivo
+            print("   → Mostrando PSD para inspección visual (cerrar ventana para continuar)...")
+            raw.plot_psd(fmin=0.5, fmax=500.0, average=False)
+
+
+if __name__ == "__main__":
+    step5_plot_psd(range(1, 10))
+
+"""
+Después de inspeccionar las PSDs, crea un CSV manual (por ejemplo
+BASE / 'bad_esg_channels_manual.csv') con columnas:
+
+subject,run,bad_channels
+sub-001,3,"S6;SC6"
+sub-001,5,"S3"
+sub-002,3,""
+
+Este CSV será leído en el Paso 6.
+"""
