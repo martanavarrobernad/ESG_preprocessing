@@ -1,0 +1,417 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  3 12:33:29 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Aplicar ICA y SSP a ESG y evaluar:
+- Residual intensity (RI)
+- Improved normalised power spectrum ratio (INPSR)
+- SNR de los SEPs
+
+Requiere:
+ - Datos "Uncleaned" a 1000 Hz: eeg_esg_1000Hz_noStimart/sub-XXX/noStimart_sr1000Hz_all_task-median_run-XX.fif
+ - Datos PCA-OBS (opcional): esg_1000Hz_ecgclean_obs/sub-XXX/noStimart_sr1000Hz_all_task-median_run-XX_ecgclean.fif
+ - TSV de R-peaks (Christov): rpeaks_christov_obs/sub-XXX_task-median_run-XX_rpeaks.tsv
+ - Anotaciones de estímulos en raw.annotations
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import mne
+from scipy.signal import welch
+
+from mne.preprocessing import ICA
+
+# ============================================================
+#  RUTAS Y PARÁMETROS GENERALES
+# ============================================================
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+
+EEG_ESG_1000 = BASE / "eeg_esg_1000Hz_noStimart"      # Uncleaned 1 kHz
+ESG_PCAOBS   = BASE / "esg_1000Hz_ecgclean_obs"       # PCA-OBS (limpio) 1 kHz
+RPEAKS_DIR   = BASE / "rpeaks_christov_obs"
+
+OUT_METRICS  = BASE / "metrics_cardiac_ICA_SSP.csv"   # salida
+
+TASK_NAME = "median"
+
+ECG_CH = "ECG"
+
+# canales de interés para median nerve (como en el paper)
+CHANNELS_MEDIAN = ["S6", "SC6", "S14"]
+
+# ventana para RI (latido) y baseline
+RI_TMIN, RI_TMAX = -0.3, 0.4      # s alrededor del R-peak
+RI_BASELINE = (-0.3, -0.2)
+
+# ventana para SNR de SEP
+SEP_TMIN, SEP_TMAX = -0.2, 0.7
+SEP_BASELINE = (-0.1, -0.01)
+
+# ventana donde esperamos el potencial negativo (median ~13 ms)
+SEP_NEG_WINDOW = (0.010, 0.030)   # s después de estímulo (ajusta si quieres)
+
+
+# ============================================================
+#  HELPERS DE CARGA
+# ============================================================
+
+def find_runs_for_subject(subject: int):
+    """Busca todos los runs disponibles en eeg_esg_1000Hz_noStimart."""
+    subj_id = f"sub-{subject:03d}"
+    subj_dir = EEG_ESG_1000 / subj_id
+    if not subj_dir.exists():
+        return []
+
+    runs = []
+    for fif in subj_dir.glob(f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-*.fif"):
+        m = re.search(r"run-(\d+)", fif.name)
+        if m:
+            runs.append(int(m.group(1)))
+    return sorted(set(runs))
+
+
+def load_uncleaned(subject: int, run: int) -> mne.io.BaseRaw:
+    subj_id = f"sub-{subject:03d}"
+    path = EEG_ESG_1000 / subj_id / f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-{run:02d}.fif"
+    return mne.io.read_raw_fif(path, preload=True, verbose="warning")
+
+
+def load_pcaobs_clean(subject: int, run: int):
+    """Devuelve raw PCA-OBS si existe, si no, None."""
+    subj_id = f"sub-{subject:03d}"
+    path = ESG_PCAOBS / subj_id / f"noStimart_sr1000Hz_all_task-{TASK_NAME}_run-{run:02d}_ecgclean.fif"
+    if path.exists():
+        return mne.io.read_raw_fif(path, preload=True, verbose="warning")
+    else:
+        return None
+
+
+def load_rpeaks(subject: int, run: int):
+    subj_id = f"sub-{subject:03d}"
+    tsv = RPEAKS_DIR / f"{subj_id}_task-{TASK_NAME}_run-{run:02d}_rpeaks.tsv"
+    df = pd.read_csv(tsv, sep="\t")
+    return df["onset_sec"].to_numpy(dtype=float)
+
+
+# ============================================================
+#  LIMPIEZA CON ICA (MNE, método CTPS)
+# ============================================================
+
+def apply_ica_cardiac(raw: mne.io.BaseRaw,
+                       ecg_ch: str = ECG_CH,
+                       n_components: int | None = None,
+                       random_state: int = 97):
+    """
+    ICA sobre todos los canales ESG+EEG con detección automática
+    de ICs cardiacos usando CTPS (Dammers et al., 2008).
+    """
+    print("   -> ICA: fitting ...")
+    ica = ICA(n_components=n_components, method="fastica",
+              random_state=random_state, max_iter="auto")
+    ica.fit(raw)
+
+    print("   -> ICA: finding ECG-related ICs (CTPS) ...")
+    ecg_inds, scores = ica.find_bads_ecg(raw, ch_name=ecg_ch, method="ctps")
+    ica.exclude = ecg_inds
+    print(f"      ECG ICs excluidas: {ecg_inds}")
+
+    raw_clean = ica.apply(raw.copy())
+    return raw_clean, ica, ecg_inds
+
+
+# ============================================================
+#  LIMPIEZA CON SSP (PROYECCIONES ESPACIALES)
+# ============================================================
+
+def apply_ssp_cardiac(raw: mne.io.BaseRaw,
+                       rpeaks_sec: np.ndarray,
+                       n_proj: int = 5,
+                       tmin: float = -0.2,
+                       tmax: float = 0.4):
+    """
+    SSP tipo Bailey et al.:
+      - epochs -0.2..0.4 s alrededor de R-peak
+      - compute_proj_epochs para obtener n_proj proyectos
+      - aplicar proyecciones al raw continuo
+    """
+    print(f"   -> SSP: creando epochs de latidos ({tmin}s..{tmax}s) ...")
+    sfreq = raw.info["sfreq"]
+    events = np.c_[raw.time_as_index(rpeaks_sec),
+                   np.zeros_like(rpeaks_sec, int),
+                   np.ones_like(rpeaks_sec, int)]
+    picks = mne.pick_types(raw.info, eeg=True, seeg=True, meg=False,
+                           ecg=False, eog=False, misc=True, exclude=())
+
+    epochs = mne.Epochs(raw, events, event_id=1,
+                        tmin=tmin, tmax=tmax,
+                        baseline=None,
+                        picks=picks,
+                        preload=True,
+                        reject_by_annotation=True,
+                        verbose="error")
+
+    print("   -> SSP: calculando proyectores ...")
+    projs = mne.compute_proj_epochs(epochs, n_eeg=n_proj, verbose="warning")
+    print(f"      nº de proyectores EEG: {len(projs)}")
+
+    raw_ssp = raw.copy().add_proj(projs).apply_proj()
+    return raw_ssp, projs
+
+
+# ============================================================
+#  MÉTRICAS
+# ============================================================
+
+def epoch_heartbeats(raw, rpeaks_sec, channels,
+                     tmin=RI_TMIN, tmax=RI_TMAX,
+                     baseline=RI_BASELINE):
+    events = np.c_[raw.time_as_index(rpeaks_sec),
+                   np.zeros_like(rpeaks_sec, int),
+                   np.ones_like(rpeaks_sec, int)]
+    picks = mne.pick_channels(raw.ch_names, include=channels)
+    epochs = mne.Epochs(raw, events, event_id=1,
+                        tmin=tmin, tmax=tmax,
+                        baseline=baseline,
+                        picks=picks,
+                        preload=True,
+                        reject_by_annotation=True,
+                        verbose="error")
+    return epochs
+
+
+def compute_RI(raw_unclean, raw_clean, rpeaks_sec, channels):
+    """Residual intensity (%)."""
+    epo_u = epoch_heartbeats(raw_unclean, rpeaks_sec, channels)
+    epo_c = epoch_heartbeats(raw_clean,   rpeaks_sec, channels)
+
+    ev_u = epo_u.average()
+    ev_c = epo_c.average()
+
+    # RMS por canal
+    rms_u = np.sqrt(np.mean(ev_u.data ** 2, axis=1))
+    rms_c = np.sqrt(np.mean(ev_c.data ** 2, axis=1))
+
+    ri_channels = (rms_c / rms_u) * 100.0
+    return float(np.mean(ri_channels))
+
+
+def compute_INPSR(raw_unclean, raw_clean, rpeaks_sec, channels):
+    """
+    Improved normalised power spectrum ratio (INPSR).
+    Devolvemos el valor medio log-transformado.
+    """
+    sfreq = raw_unclean.info["sfreq"]
+
+    # frecuencia cardiaca fundamental y 4 armónicos
+    rr = np.diff(rpeaks_sec)
+    f0 = 1.0 / np.mean(rr)       # Hz
+    harmonics = f0 * np.arange(1, 5)
+
+    def band_power(f, Pxx, fc, width=0.2):
+        half = width / 2.0
+        mask = (f >= fc - half) & (f <= fc + half)
+        if not np.any(mask):
+            return 0.0
+        return np.trapz(Pxx[mask], f[mask])
+
+    inpsr_channels = []
+
+    for ch in channels:
+        pick = mne.pick_channels(raw_unclean.ch_names, [ch])[0]
+        x_u = raw_unclean.get_data(picks=[pick])[0]
+        x_c = raw_clean.get_data(picks=[pick])[0]
+
+        f, P_u = welch(x_u, fs=sfreq, nperseg=4096)
+        _, P_c = welch(x_c, fs=sfreq, nperseg=4096)
+
+        total_u = sum(band_power(f, P_u, fh) for fh in harmonics)
+        total_c = sum(band_power(f, P_c, fh) for fh in harmonics)
+
+        if total_c == 0:
+            continue
+        inpsr = total_u / total_c
+        inpsr_channels.append(inpsr)
+
+    if not inpsr_channels:
+        return np.nan
+
+    # log-transform como en el paper
+    inpsr_log = np.log(inpsr_channels)
+    return float(np.mean(inpsr_log))
+
+
+def get_median_stim_events(raw):
+    """Eventos de estimulación mediana a partir de las anotaciones."""
+    events, event_id = mne.events_from_annotations(raw, verbose="error")
+    if not len(event_id):
+        raise RuntimeError("No hay anotaciones en el Raw para estímulos.")
+
+    sel_ids = [v for k, v in event_id.items() if "median" in k.lower()]
+    if not sel_ids:
+        # si no aparece 'median', usamos todos
+        sel_ids = list(event_id.values())
+
+    mask = np.isin(events[:, 2], sel_ids)
+    return events[mask]
+
+
+def compute_SNR_SEP(raw, channels, condition="median"):
+    """
+    SNR de los SEPs:
+      - epoch -0.2..0.7 s
+      - baseline -0.1..-0.01
+      - peak amplitude: mayor negatividad en ventana SEP_NEG_WINDOW
+      - SNR = |peak| / std(baseline)
+    """
+    events = get_median_stim_events(raw)
+    picks = mne.pick_channels(raw.ch_names, include=channels)
+
+    epochs = mne.Epochs(raw, events, event_id=None,
+                        tmin=SEP_TMIN, tmax=SEP_TMAX,
+                        baseline=SEP_BASELINE,
+                        picks=picks,
+                        preload=True,
+                        reject_by_annotation=True,
+                        verbose="error")
+
+    evoked = epochs.average()
+    times = evoked.times
+
+    # ventana de potencial
+    t0, t1 = SEP_NEG_WINDOW
+    idx_win = (times >= t0) & (times <= t1)
+    data_win = evoked.data[:, idx_win]
+
+    # buscar la muestra con mayor negatividad en todos los canales de interés
+    flat_idx = np.argmin(data_win)
+    ch_idx, t_idx = np.unravel_index(flat_idx, data_win.shape)
+    peak_amp = abs(data_win[ch_idx, t_idx])
+
+    # std del baseline de ese canal
+    t_base0, t_base1 = SEP_BASELINE
+    base_mask = (epochs.times >= t_base0) & (epochs.times <= t_base1)
+    base_data = epochs.get_data()[:, ch_idx, :][:, base_mask]
+    std_base = base_data.std()
+
+    if std_base == 0:
+        return np.nan
+
+    return float(peak_amp / std_base)
+
+
+def compute_metrics_for_method(method_name,
+                               raw_unclean,
+                               raw_clean,
+                               rpeaks_sec,
+                               channels):
+    """Devuelve dict con RI, INPSR (log) y SNR para un método."""
+    ri = compute_RI(raw_unclean, raw_clean, rpeaks_sec, channels)
+    inpsr = compute_INPSR(raw_unclean, raw_clean, rpeaks_sec, channels)
+    snr = compute_SNR_SEP(raw_clean, channels)
+    return {
+        "method": method_name,
+        "RI_percent": ri,
+        "INPSR_log": inpsr,
+        "SNR_SEP": snr,
+    }
+
+
+# ============================================================
+#  PIPELINE PRINCIPAL
+# ============================================================
+
+def run_ica_ssp_and_metrics(subjects):
+    """
+    Para cada sujeto y run:
+      - carga Uncleaned
+      - carga PCA-OBS (si existe)
+      - aplica ICA
+      - aplica SSP (usando R-peaks)
+      - calcula métricas para PCA-OBS, ICA y SSP
+    """
+    results = []
+
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        runs = find_runs_for_subject(s)
+        if not runs:
+            print(f"{subj_id}: sin runs en 1000 Hz, salto.")
+            continue
+
+        print(f"\n================ SUJETO {subj_id} ================")
+
+        for run in runs:
+            print(f"\n--- run-{run:02d} ---")
+
+            # cargar datos
+            raw_u = load_uncleaned(s, run)
+            rpeaks_sec = load_rpeaks(s, run)
+
+            # recorta sólo canales de interés + ECG para ahorrar
+            picks = mne.pick_channels(raw_u.ch_names,
+                                      include=list(set(CHANNELS_MEDIAN + [ECG_CH])))
+            raw_u.pick(picks)
+
+            # PCA-OBS (si existe)
+            raw_pca = load_pcaobs_clean(s, run)
+            if raw_pca is not None:
+                raw_pca.pick_channels(raw_u.ch_names)  # alinear canales
+                m_pca = compute_metrics_for_method("PCA-OBS",
+                                                   raw_u, raw_pca,
+                                                   rpeaks_sec,
+                                                   CHANNELS_MEDIAN)
+                m_pca.update(subject=subj_id, run=run)
+                results.append(m_pca)
+                print(f"   PCA-OBS -> RI={m_pca['RI_percent']:.3f}%, "
+                      f"INPSRlog={m_pca['INPSR_log']:.3f}, "
+                      f"SNR={m_pca['SNR_SEP']:.3f}")
+            else:
+                print("   ⚠ No hay fichero PCA-OBS para este run.")
+
+            # ICA
+            raw_ica, ica, ecg_inds = apply_ica_cardiac(raw_u, ecg_ch=ECG_CH)
+            m_ica = compute_metrics_for_method("ICA",
+                                               raw_u, raw_ica,
+                                               rpeaks_sec,
+                                               CHANNELS_MEDIAN)
+            m_ica.update(subject=subj_id, run=run)
+            results.append(m_ica)
+            print(f"   ICA -> RI={m_ica['RI_percent']:.3f}%, "
+                  f"INPSRlog={m_ica['INPSR_log']:.3f}, "
+                  f"SNR={m_ica['SNR_SEP']:.3f}")
+
+            # SSP
+            raw_ssp, projs = apply_ssp_cardiac(raw_u, rpeaks_sec, n_proj=5)
+            m_ssp = compute_metrics_for_method("SSP",
+                                               raw_u, raw_ssp,
+                                               rpeaks_sec,
+                                               CHANNELS_MEDIAN)
+            m_ssp.update(subject=subj_id, run=run)
+            results.append(m_ssp)
+            print(f"   SSP -> RI={m_ssp['RI_percent']:.3f}%, "
+                  f"INPSRlog={m_ssp['INPSR_log']:.3f}, "
+                  f"SNR={m_ssp['SNR_SEP']:.3f}")
+
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(OUT_METRICS, index=False)
+        print(f"\nMétricas guardadas en: {OUT_METRICS}")
+    else:
+        print("\nNo se calcularon métricas (¿sin datos?)")
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    # ajusta el rango de sujetos
+    run_ica_ssp_and_metrics(subjects=range(1, 10))
