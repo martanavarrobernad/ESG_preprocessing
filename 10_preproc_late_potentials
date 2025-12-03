@@ -1,9 +1,16 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec  3 15:31:31 2025
+
+@author: navar
+"""
+
 # 10_preproc_late_potentials.py
 """
 Paso 10: preprocesado para potenciales tardíos.
 
 Igual que pasos 7–9, pero:
-  - referencia: siempre TH6
+  - referencia: siempre TH6 (ya viene así de esg_step6_concat_ref)
   - band-pass: 5–400 Hz (en vez de 30–400 Hz)
 
 Entrada:
@@ -31,8 +38,19 @@ for d in (OUT7, OUT8, OUT9):
 THRESH_V = 100e-6  # 100 µV
 STIM_KEYWORDS = ["median", "stim", "pulse"]
 
+# tus canales ESG cervicales
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6",
+]
+
 
 def mark_bad_segments(raw, picks_esg, thresh=THRESH_V):
+    if picks_esg is None or len(picks_esg) == 0:
+        print("   ⚠ mark_bad_segments: picks_esg vacío, no se marca nada.")
+        return raw
+
     data = raw.get_data(picks=picks_esg)
     n_ch, n_t = data.shape
     bad_mask = np.abs(data) > thresh
@@ -48,10 +66,13 @@ def mark_bad_segments(raw, picks_esg, thresh=THRESH_V):
             keep_ch.append(idx)
 
     if bad_ch:
+        print(f"   → Excluyendo canales con >50% muestras >100µV: {bad_ch}")
         raw.info["bads"].extend(bad_ch)
 
     if keep_ch:
-        keep_mask = bad_mask[[picks_esg.tolist().index(k) for k in keep_ch]]
+        # reordenar máscara para los índices que se quedan
+        idx_map = [list(picks_esg).index(k) for k in keep_ch]
+        keep_mask = bad_mask[idx_map]
         bad_any = keep_mask.any(axis=0)
     else:
         bad_any = np.zeros(n_t, dtype=bool)
@@ -73,6 +94,7 @@ def mark_bad_segments(raw, picks_esg, thresh=THRESH_V):
         durations.append((n_t - start) / sfreq)
 
     if onsets:
+        print(f"   → Añadiendo {len(onsets)} anotaciones BAD_100uV")
         ann = mne.Annotations(onset=onsets, duration=durations,
                               description=["BAD_100uV"] * len(onsets))
         raw.set_annotations(raw.annotations + ann)
@@ -84,14 +106,19 @@ def pick_stim_events(raw):
     events, event_id = mne.events_from_annotations(raw, verbose="error")
     if not event_id:
         raise RuntimeError("No annotations → no stimulus events.")
+
     sel_ids = []
     for desc, code in event_id.items():
         if any(k in desc.lower() for k in STIM_KEYWORDS):
             sel_ids.append(code)
     if not sel_ids:
         sel_ids = list(event_id.values())
-    mask = mne.pick_events(events, include=sel_ids)
-    return events[mask], {k: v for k, v in event_id.items() if v in sel_ids}
+
+    # mne.pick_events devuelve directamente los eventos filtrados
+    selected_events = mne.pick_events(events, include=sel_ids)
+    selected_event_id = {k: v for k, v in event_id.items() if v in sel_ids}
+
+    return selected_events, selected_event_id
 
 
 def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
@@ -111,7 +138,7 @@ def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
         raw = mne.io.read_raw_fif(fif_path, preload=True, verbose="warning")
 
         # Paso 7 (late): notch + BPF 5–400
-        print("   → Notch 48–53 Hz (approx, notch 50 Hz width 5 Hz)...")
+        print("   → Notch 50 Hz (ancho ~5 Hz)...")
         raw.notch_filter(
             freqs=[50.0],
             notch_widths=5.0,
@@ -140,7 +167,15 @@ def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
         # Paso 8 (late): 100 µV
         print("   → Paso 8 (late) umbral 100 µV continuo...")
         raw = mne.io.read_raw_fif(out7_fif, preload=True, verbose="warning")
-        picks_esg = mne.pick_types(raw.info, eeg=False, meg=False, misc=True, ecg=False, eog=False, stim=False)
+
+        # ESG por nombre, no por tipo
+        esg_ch_present = [ch for ch in ESG_CERV if ch in raw.ch_names]
+        if not esg_ch_present:
+            print("   ⚠ Ningún canal ESG_CERV encontrado en late-filt, salto sujeto.")
+            print("      Canales del raw:", raw.ch_names)
+            continue
+
+        picks_esg = mne.pick_channels(raw.ch_names, include=esg_ch_present)
         raw = mark_bad_segments(raw, picks_esg)
 
         out8_subdir = OUT8 / subj_id
@@ -149,7 +184,7 @@ def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
         raw.save(out8_fif, overwrite=True)
         print(f"   ✔ Guardado late clean: {out8_fif}")
 
-        # Paso 9 (late): epocaje mismo rango que temprano salvo que quieras cambiarlo
+        # Paso 9 (late): epocaje
         print("   → Paso 9 (late) epocaje...")
         raw = mne.io.read_raw_fif(out8_fif, preload=True, verbose="warning")
         events, event_id = pick_stim_events(raw)
@@ -175,3 +210,4 @@ def run_late_pipeline(subjects=range(1, 10), condition_label="median"):
 
 if __name__ == "__main__":
     run_late_pipeline(range(1, 10), condition_label="median")
+
