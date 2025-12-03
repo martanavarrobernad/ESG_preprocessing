@@ -1,0 +1,84 @@
+# 9_epoch_and_baseline_early.py
+"""
+Paso 9: epocaje para potenciales tempranos (SEPs):
+
+  - ventana: -200 ms a 700 ms
+  - baseline: -110 ms a -10 ms
+
+Entrada:
+  - esg_step8_clean_early/sub-XXX/..._early_clean.fif
+
+Salida:
+  - esg_step9_epochs_early/sub-XXX/..._early-epo.fif
+"""
+
+from pathlib import Path
+import mne
+
+BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
+IN_DIR  = BASE / "esg_step8_clean_early"
+OUT_DIR = BASE / "esg_step9_epochs_early"
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+# etiquetas de anotación que marcan estímulos (ajusta si tus annotations son distintas)
+STIM_KEYWORDS = ["median", "stim", "pulse"]
+
+
+def pick_stim_events(raw):
+    events, event_id = mne.events_from_annotations(raw, verbose="error")
+    if not event_id:
+        raise RuntimeError("No annotations → no stimulus events.")
+
+    # filtra por palabras clave en las descripciones
+    selected_ids = []
+    for desc, code in event_id.items():
+        if any(k in desc.lower() for k in STIM_KEYWORDS):
+            selected_ids.append(code)
+
+    if not selected_ids:
+        # si no hay match, usamos todos
+        selected_ids = list(event_id.values())
+
+    mask = mne.pick_events(events, include=selected_ids)
+    return events[mask], {k: v for k, v in event_id.items() if v in selected_ids}
+
+
+def step9_epoch_early(subjects=range(1, 10)):
+    for s in subjects:
+        subj_id = f"sub-{s:03d}"
+        subj_dir = IN_DIR / subj_id
+        if not subj_dir.exists():
+            continue
+
+        fif_files = sorted(subj_dir.glob("*_early_clean.fif"))
+        if not fif_files:
+            continue
+
+        print(f"\n===== {subj_id} =====")
+        for fif in fif_files:
+            print(f"  Cargando {fif.name}")
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+
+            events, event_id = pick_stim_events(raw)
+
+            epochs = mne.Epochs(
+                raw,
+                events,
+                event_id=event_id,
+                tmin=-0.2,
+                tmax=0.7,
+                baseline=(-0.11, -0.01),
+                reject_by_annotation=True,
+                preload=True,
+                verbose="error",
+            )
+
+            out_subdir = OUT_DIR / subj_id
+            out_subdir.mkdir(exist_ok=True, parents=True)
+            out_fif = out_subdir / fif.name.replace("_early_clean.fif", "_early-epo.fif")
+            epochs.save(out_fif, overwrite=True)
+            print(f"   ✔ Guardado epochs tempranos: {out_fif}")
+
+
+if __name__ == "__main__":
+    step9_epoch_early(range(1, 10))
