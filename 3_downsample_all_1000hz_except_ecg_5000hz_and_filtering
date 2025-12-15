@@ -13,7 +13,7 @@ Input (per run):
     eeg_esg_10kHz_noStimart/sub-XXX/noStimart_10kHz_task-<TASK>_run-XX.fif
 
 Output (per run):
-    1000Hz_noStimart/sub-XXX/noStimart_sr1000Hz_all_task-<TASK>_run-XX.fif
+    eeg_esg_1000Hz_noStimart/sub-XXX/noStimart_sr1000Hz_all_task-<TASK>_run-XX.fif
     ecg_5000Hz_noStimart/sub-XXX/noStimart_sr5000Hz_ecg_task-<TASK>_run-XX.fif
 """
 
