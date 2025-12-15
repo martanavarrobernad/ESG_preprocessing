@@ -28,7 +28,7 @@ BASE = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0")
 CFG_WIN_CSV = BASE / "cfg_artifact_windows_cervical.csv"
 
 # Output directory for artifact-cleaned data
-OUT_DIR = BASE / "10kHz_noStimart"
+OUT_DIR = BASE / "eeg_esg_10kHz_noStimart"
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 TASK_NAME = "median"
