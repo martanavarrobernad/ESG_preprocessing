@@ -1,15 +1,6 @@
-# -*- coding: utf-8 -*-
 """
-Created on Fri Nov 21 15:55:56 2025
-
-@author: martanavarrobernad
-
-Interactive inspection of cervical ESG channels from a RAW EEG/ESG/EEGLAB/MEG file.
-
-Loads a file without preloading (RAM-efficient) and opens an interactive MNE browser
-restricted to cervical ESG channels.
-
-Adjust RAW_FILE to inspect any dataset.
+Interactive inspection of cervical ESG channels from a RAW EEG/ESG file.
+Works with .fif, .set (EEGLAB) and BrainVision (.vhdr/.eeg/.vmrk)
 """
 
 from pathlib import Path
@@ -17,15 +8,14 @@ import mne
 
 # === List of cervical ESG channels ===
 ESG_CERV = [
-    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "Iz", "SC1", "SC6", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
     "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
-    "SC6"
+    "AC", "TH6"
 ]
 
 # ================= CONFIGURATION (edit this) =================
-RAW_FILE = Path(
-    r"C:\Users\navar\Desktop\example_file.fif"   # <-- change to any file you want to inspect
-)
+# for BrainVision, point to the .vhdr file
+RAW_FILE = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01\MULTICONS_2025-12-16_Run1.vhdr")
 
 # ================= 1) LOAD WITHOUT PRELOAD ==================
 print(f"Loading: {RAW_FILE}")
@@ -35,6 +25,8 @@ if suffix == ".fif":
     raw = mne.io.read_raw_fif(RAW_FILE, preload=False, verbose="warning")
 elif suffix == ".set":
     raw = mne.io.read_raw_eeglab(RAW_FILE, preload=False, verbose="warning")
+elif suffix == ".vhdr":
+    raw = mne.io.read_raw_brainvision(RAW_FILE, preload=False, verbose="warning")
 else:
     raise ValueError(f"Unsupported file extension: {suffix}")
 
@@ -46,19 +38,16 @@ picks_esg = [ch for ch in ESG_CERV if ch in raw.ch_names]
 print(f"\nDisplaying {len(picks_esg)} ESG channels:")
 print(picks_esg)
 
+if len(picks_esg) == 0:
+    print("\nWARNING: None of the ESG_CERV channel names were found in raw.ch_names.")
+    print("Available channels (first 50):")
+    print(raw.ch_names[:50])
+
 # ================= 3) INTERACTIVE PLOT ==================
 raw.plot(
-    picks=picks_esg,
-    duration=4.0,            # width of time window in seconds
-    start=0.0,               # start time for visualization
-    n_channels=min(len(picks_esg), 20),
-    block=True               # keeps the window open until closed manually
+    picks=picks_esg if len(picks_esg) > 0 else None,  # if none found, show all
+    duration=4.0,
+    start=0.0,
+    n_channels=min(max(len(picks_esg), 1), 20),
+    block=True
 )
-
-"""
-Instructions:
-- Scroll horizontally using the mouse wheel or bottom scrollbar.
-- Double-click a trace to auto-scale it.
-- Use the "Scale" button to adjust amplitude.
-- Use "Go to" to jump to a specific time.
-"""
